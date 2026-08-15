@@ -1,0 +1,26 @@
+# --- signing: NEVER commit these ---------------------------------------------
+# sundial-release.jks is the release signing key and keystore.properties holds
+# its passwords in plaintext. Publishing either lets anyone ship a signed
+# "update" to this app. Lose the key and Android refuses to install any future
+# update over an installed copy, so back it up somewhere that is not this repo.
+*.jks
+*.keystore
+keystore.properties
+
+# --- machine-local paths ------------------------------------------------------
+local.properties
+
+# --- build output -------------------------------------------------------------
+build/
+.gradle/
+.kotlin/
+*.apk
+*.aab
+*.ap_
+*.dex
+captures/
+
+# --- IDE ----------------------------------------------------------------------
+.idea/
+*.iml
+.DS_Store
