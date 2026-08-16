@@ -87,12 +87,17 @@ class LoopbackServer : Closeable {
     // whenever that exchange then fails (no network permission, blocked DNS),
     // which sends the user back to the sign-in screen with no explanation.
     // State only what has actually happened: Google returned the code.
+    //
+    // It also auto-returns, which is not just polish. The exchange cannot run until
+    // Sundial has a visible window again -- Android 15 blocks network requests from a
+    // backgrounded process and reports them as DNS failures -- so every second this
+    // page sits unread is a second AuthRepository.awaitForeground spends waiting.
     private fun successPage(): String = page(
         title = "Authorised",
         heading = "Google approved Sundial",
-        detail = "Go back to the app to finish signing in. If it returns to the sign-in " +
-            "screen, the app could not reach Google to complete the exchange, and the " +
-            "reason is shown there.",
+        detail = "Returning you to the app to finish signing in. If Sundial opens on the " +
+            "sign-in screen instead, the exchange failed and the reason is shown there.",
+        autoReturn = true,
     )
 
     private fun errorPage(params: Map<String, String>): String {
@@ -101,13 +106,22 @@ class LoopbackServer : Closeable {
             title = "Sign-in failed",
             heading = "Sign-in didn't complete",
             detail = escapeHtml(reason),
+            // Nothing is waiting on the app here, and bouncing away would take the
+            // reason off screen before it could be read.
+            autoReturn = false,
         )
     }
 
-    private fun page(title: String, heading: String, detail: String): String = """
+    private fun page(
+        title: String,
+        heading: String,
+        detail: String,
+        autoReturn: Boolean,
+    ): String = """
         <!doctype html>
         <html><head><meta charset="utf-8">
         <meta name="viewport" content="width=device-width,initial-scale=1">
+        ${if (autoReturn) autoReturnMeta() else ""}
         <title>$title</title>
         <style>
           :root { color-scheme: light dark; }
@@ -137,6 +151,17 @@ class LoopbackServer : Closeable {
         </script>
         </body></html>
     """.trimIndent()
+
+    /**
+     * Best-effort automatic return, with the button as the guarantee.
+     *
+     * Browsers vary on whether they will follow a navigation to an intent: URL without
+     * a user gesture, and a blocked one is silent, so this is never the only way back.
+     * The short delay lets the page paint first, which keeps the fallback visible if
+     * the browser does refuse.
+     */
+    private fun autoReturnMeta(): String =
+        """<meta http-equiv="refresh" content="1;url=$RETURN_INTENT_URI">"""
 
     private fun escapeHtml(value: String): String = value
         .replace("&", "&amp;")

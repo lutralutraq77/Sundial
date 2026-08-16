@@ -38,7 +38,10 @@ class LoopbackServerTest {
             val (status, body) = hit("${server.redirectUri}/?code=4%2F0Axyz&state=abc123&scope=calendar")
 
             assertEquals(200, status)
-            assertTrue(body, body.contains("signed in", ignoreCase = true))
+            // Was asserting "signed in", which the page has never said -- it says
+            // "signing in", deliberately, because at this point nothing has been
+            // exchanged yet. The assertion passed no build.
+            assertTrue(body, body.contains("finish signing in", ignoreCase = true))
 
             val params = redirect.get(5, TimeUnit.SECONDS)
             assertEquals("4/0Axyz", params["code"])
@@ -46,6 +49,34 @@ class LoopbackServerTest {
             assertEquals("calendar", params["scope"])
         } finally {
             server.close()
+            pool.shutdownNow()
+        }
+    }
+
+    @Test
+    fun `success page returns to the app automatically, failure page does not`() {
+        // The token exchange cannot run until Sundial is visible again, so the success
+        // page has to hand the foreground back without waiting for a tap. The failure
+        // page must not, or the reason scrolls past before it can be read.
+        val granted = LoopbackServer()
+        val denied = LoopbackServer()
+        val pool = Executors.newFixedThreadPool(2)
+        try {
+            pool.submit<Map<String, String>> { granted.awaitRedirect() }
+            pool.submit<Map<String, String>> { denied.awaitRedirect() }
+
+            val (_, successBody) = hit("${granted.redirectUri}/?code=abc&state=xyz")
+            val (_, errorBody) = hit("${denied.redirectUri}/?error=access_denied")
+
+            assertTrue(successBody, successBody.contains("http-equiv=\"refresh\""))
+            assertTrue(successBody, successBody.contains("scheme=sundial"))
+            assertTrue(errorBody, !errorBody.contains("http-equiv=\"refresh\""))
+            // The manual fallback survives on both, since browsers may refuse to
+            // follow an intent: URL without a user gesture.
+            assertTrue(errorBody, errorBody.contains("Return to Sundial"))
+        } finally {
+            granted.close()
+            denied.close()
             pool.shutdownNow()
         }
     }

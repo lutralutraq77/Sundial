@@ -3,14 +3,21 @@ package dev.danny.sundial.auth
 import android.content.Context
 import android.net.Uri
 import android.util.Base64
+import android.util.Log
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.ProcessLifecycleOwner
 import dev.danny.sundial.net.Http
+import dev.danny.sundial.net.NetworkDiagnostics
+import dev.danny.sundial.net.NetworkFailure
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -137,6 +144,19 @@ class AuthRepository(private val appContext: Context) {
                 params["error_description"] ?: params["error"] ?: "Sign-in was cancelled.",
             )
 
+            // The redirect arrives while the browser is still in front: awaitRedirect
+            // returns the instant Google's GET hits the loopback port, long before the
+            // user has dismissed the "Google approved Sundial" page. Exchanging the code
+            // right here means issuing an HTTPS request from a process with no visible
+            // component, which Android 15 refuses -- and reports as UnknownHostException,
+            // so it reads as broken DNS rather than as the deliberate block it is.
+            //
+            // Moving sign-in into an application scope is what made this reliable rather
+            // than intermittent: the exchange used to be cancelled along with the
+            // Activity, so it never ran at all. Now it always runs, always from the
+            // background. Wait for a visible window first.
+            awaitForeground()
+
             val token = postForm(
                 mapOf(
                     "code" to code,
@@ -163,7 +183,10 @@ class AuthRepository(private val appContext: Context) {
 
             Result.success(email ?: "your Google account")
         } catch (t: Throwable) {
-            Result.failure(if (t is AuthException) t else AuthException(describeSignInError(t)))
+            Log.w(TAG, "Sign-in failed", t)
+            Result.failure(
+                if (t is AuthException) t else AuthException(describeSignInError(t), cause = t),
+            )
         } finally {
             server.close()
             pendingServer = null
@@ -171,22 +194,40 @@ class AuthRepository(private val appContext: Context) {
     }
 
     /**
-     * State the actual condition, not the resolver's internals.
+     * Report what was observed, then what the system says about it.
      *
-     * On GrapheneOS a denied Network permission does not refuse connections --
-     * it hides the DNS resolver, so the app sees UnknownHostException
-     * ("Unable to resolve host ...") even with Wi-Fi visibly connected. Every
-     * GrapheneOS user who unticks Network at install hits this on sign-in.
+     * The wording this replaces named the GrapheneOS Network toggle for every
+     * UnknownHostException. That is the one cause it could not be: LoopbackServer binds
+     * 127.0.0.1 earlier in this same method, and GrapheneOS guards loopback with the
+     * same permission, so a revoked toggle never reaches the token exchange. See
+     * NetworkFailure for the full argument.
      */
-    private fun describeSignInError(t: Throwable): String = when (t) {
-        is java.net.UnknownHostException ->
-            "Could not reach Google — this app has no network access. If Wi-Fi is on, " +
-                "check Settings → Apps → Sundial → Permissions → Network (GrapheneOS " +
-                "disables DNS entirely when that toggle is off), then try again."
-        is java.net.SocketTimeoutException -> "Google took too long to answer. Try again."
-        is javax.net.ssl.SSLException ->
-            "Secure connection to Google failed. Check the clock and any VPN, then try again."
-        else -> t.message ?: "Sign-in failed."
+    private suspend fun describeSignInError(t: Throwable): String {
+        val diagnostics = runCatching {
+            NetworkDiagnostics.capture(appContext, appWasForeground = isForeground())
+        }.getOrNull()
+        return listOfNotNull(NetworkFailure.describe(t), diagnostics?.explain())
+            .joinToString(" ")
+    }
+
+    /**
+     * Suspends until Sundial has a visible window again, giving up after
+     * [FOREGROUND_WAIT_MS] and letting the request proceed regardless.
+     *
+     * The timeout matters: if the user walks away from the browser, failing with a
+     * blunt "you were in the background" is worse than trying the exchange and
+     * reporting whatever actually comes back.
+     */
+    private suspend fun awaitForeground() {
+        val lifecycle = withContext(Dispatchers.Main) { ProcessLifecycleOwner.get().lifecycle }
+        if (lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) return
+        withTimeoutOrNull(FOREGROUND_WAIT_MS) {
+            lifecycle.currentStateFlow.first { it.isAtLeast(Lifecycle.State.STARTED) }
+        }
+    }
+
+    private suspend fun isForeground(): Boolean = withContext(Dispatchers.Main) {
+        ProcessLifecycleOwner.get().lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)
     }
 
     /** Unblocks a sign-in that is waiting on the browser. */
@@ -296,6 +337,32 @@ class AuthRepository(private val appContext: Context) {
     // ---- helpers -------------------------------------------------------
 
     private suspend fun postForm(params: Map<String, String>): TokenResponse =
+        retryingOnTransientNetwork { postFormOnce(params) }
+
+    /**
+     * Retries only the failures that prove nothing left the device.
+     *
+     * OkHttp will not do this: retryOnConnectionFailure does not cover a first-attempt
+     * UnknownHostException, so a single unlucky lookup ends the whole sign-in. Retrying
+     * an authorization-code exchange is safe precisely because these two exceptions mean
+     * no request was ever sent -- a code that Google has actually seen would come back
+     * as invalid_grant instead, which is an AuthException and propagates immediately.
+     */
+    private suspend fun <T> retryingOnTransientNetwork(block: suspend () -> T): T {
+        var last: Throwable? = null
+        repeat(NETWORK_ATTEMPTS) { attempt ->
+            try {
+                return block()
+            } catch (t: Throwable) {
+                if (t !is java.net.UnknownHostException && t !is java.net.ConnectException) throw t
+                last = t
+                if (attempt < NETWORK_ATTEMPTS - 1) delay(RETRY_BASE_MS shl attempt)
+            }
+        }
+        throw last ?: IllegalStateException("Retry loop ended without a result")
+    }
+
+    private suspend fun postFormOnce(params: Map<String, String>): TokenResponse =
         withContext(Dispatchers.IO) {
             val body = FormBody.Builder().apply {
                 params.forEach { (key, value) -> add(key, value) }
@@ -339,6 +406,8 @@ class AuthRepository(private val appContext: Context) {
     )
 
     private companion object {
+        const val TAG = "SundialAuth"
+
         const val KEY_CLIENT_ID = "client_id"
         const val KEY_CLIENT_SECRET = "client_secret"
         const val KEY_REFRESH_TOKEN = "refresh_token"
@@ -348,5 +417,15 @@ class AuthRepository(private val appContext: Context) {
 
         const val TOKEN_SKEW_MS = 60_000L
         const val SIGN_IN_TIMEOUT_MS = 10 * 60 * 1000L
+
+        /**
+         * How long to wait for a visible window before exchanging the code anyway.
+         * The loopback page returns automatically, so in practice this resolves in
+         * well under a second; the budget is for the user who wanders off.
+         */
+        const val FOREGROUND_WAIT_MS = 60_000L
+
+        const val NETWORK_ATTEMPTS = 3
+        const val RETRY_BASE_MS = 500L
     }
 }

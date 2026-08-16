@@ -18,11 +18,17 @@ data class TokenResponse(
 /**
  * [requiresReauth] means the stored grant is gone for good — the UI should send the
  * user back through sign-in rather than offering a retry.
+ *
+ * [cause] is carried so the original failure survives the wrapping. Without it the
+ * resolver's own words — the only thing separating an ordinary lookup failure from a
+ * refused socket — were destroyed at the point of wrapping, leaving nothing to
+ * diagnose from afterwards.
  */
 class AuthException(
     message: String,
     val requiresReauth: Boolean = false,
-) : Exception(message)
+    cause: Throwable? = null,
+) : Exception(message, cause)
 
 data class AuthState(
     val hasCredentials: Boolean = false,

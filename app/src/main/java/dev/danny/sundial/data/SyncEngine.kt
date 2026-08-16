@@ -6,6 +6,7 @@ import dev.danny.sundial.core.SyncOutcome
 import dev.danny.sundial.core.TimeUtil
 import dev.danny.sundial.net.ApiException
 import dev.danny.sundial.net.CalendarApi
+import dev.danny.sundial.net.NetworkFailure
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -115,13 +116,12 @@ class SyncEngine(
         )
     }
 
-    private fun describe(e: Exception): String = when (e) {
-        // GrapheneOS with Network permission denied looks exactly like this too.
-        is java.net.UnknownHostException -> "No network access (offline, or Network permission off)."
-        is java.net.SocketTimeoutException -> "Google Calendar timed out."
-        is javax.net.ssl.SSLException -> "Secure connection failed."
-        else -> e.message ?: e::class.java.simpleName
-    }
+    // Was: "No network access (offline, or Network permission off)." -- an assertion
+    // about a permission this code never checked, drawn from an exception type that
+    // does not indicate it. NetworkFailure states what was observed instead; a denied
+    // permission has its own signature (EACCES from socket(2)) and gets named only when
+    // that is what actually happened.
+    private fun describe(e: Exception): String = NetworkFailure.describe(e)
 
     private fun cacheEventColors(colors: Map<String, String>) {
         store.setMeta(META_EVENT_COLORS, colors.entries.joinToString(";") { "${it.key}=${it.value}" })
