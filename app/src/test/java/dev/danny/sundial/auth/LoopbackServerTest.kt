@@ -161,8 +161,12 @@ class LoopbackServerTest {
         try {
             pool.submit<Map<String, String>> { server.awaitRedirect() }
             val (_, body) = hit("${server.redirectUri}/?error=x&error_description=%3Cscript%3E")
-            assertTrue(body, body.contains("&lt;script&gt;"))
-            assertTrue(body, !body.contains("<script>"))
+            // Pin the payload to the slot it is interpolated into. The blanket
+            // assertion this replaces -- no "<script>" anywhere in the body -- could
+            // never hold: the page carries a <script> block of its own for the return
+            // button, so it failed on every build regardless of the escaping.
+            assertTrue(body, body.contains("<p>&lt;script&gt;</p>"))
+            assertTrue(body, !body.contains("<p><script>"))
         } finally {
             server.close()
             pool.shutdownNow()
