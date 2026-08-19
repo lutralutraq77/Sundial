@@ -85,40 +85,57 @@ data class NetworkDiagnostics(
     val appWasForeground: Boolean,
 ) {
 
-    /** The most likely cause, or null when nothing measurable stood out. */
-    fun explain(): String? = when {
-        socketError != null ->
-            "Sundial cannot open network sockets ($socketError) -- check Settings -> " +
-                "Apps -> Sundial -> Permissions -> Network."
+    /**
+     * Every observation that held, or null when none did.
+     *
+     * Deliberately not a `when`. Returning the first match would pick one cause and
+     * assert it, which is the habit this class exists to break -- and these conditions
+     * genuinely co-occur: a backgrounded request on a device whose network also reports
+     * down would have had the Android 15 block silently outranked. Report what was
+     * measured and let the reader weigh it.
+     */
+    fun explain(): String? = listOfNotNull(
+        socketError?.let {
+            "Sundial cannot open network sockets ($it) -- check Settings -> Apps -> " +
+                "Sundial -> Permissions -> Network."
+        },
 
         // GrapheneOS documents exactly this shape for a denied Network permission:
         // "When the Network permission is disabled, GrapheneOS pretends the network is
         // down. It shows the network as down in various APIs, returns errors showing a
         // network connectivity issue rather than a revoked permission." An always-on
         // VPN in lockdown mode looks the same from here, so name both.
-        !hasActiveNetwork ->
+        // Parentheses are load-bearing throughout: `.takeIf` binds tighter than `+`, so
+        // without them it applies to the last fragment alone and a false condition
+        // concatenates the string "null" onto the rest instead of dropping the entry.
+        (
             "The system reports no usable network for Sundial, though the device appears " +
                 "online. That is how a denied Network permission and an always-on VPN in " +
                 "lockdown mode both look from inside the app."
+            ).takeIf { !hasActiveNetwork },
 
         // Android 15 fails requests started "outside of a valid process lifecycle" with
         // an UnknownHostException, which is indistinguishable from real DNS trouble
         // unless we record where the app was at the time.
-        !appWasForeground ->
+        (
             "Sundial was in the background when the request ran. Android 15 blocks " +
                 "background network requests and reports them as DNS failures."
+            ).takeIf { !appWasForeground },
 
-        privateDnsActive ->
+        (
             "Private DNS is active (${privateDnsHost ?: "automatic"}); if that resolver " +
                 "is unreachable, every lookup fails."
+            ).takeIf { privateDnsActive },
 
-        vpn -> "A VPN is active and may be routing or blocking this app's traffic."
+        "A VPN is active and may be routing or blocking this app's traffic."
+            .takeIf { vpn },
 
-        !validated ->
-            "The current network is not validated -- a captive portal may need signing in to."
-
-        else -> null
-    }
+        // Guarded on hasActiveNetwork: with no network there are no capabilities to
+        // read, so `validated` is false for want of an answer rather than because a
+        // portal is in the way. Unguarded, that reads as a captive-portal claim.
+        "The current network is not validated -- a captive portal may need signing in to."
+            .takeIf { hasActiveNetwork && !validated },
+    ).joinToString(" ").takeIf { it.isNotEmpty() }
 
     companion object {
 
