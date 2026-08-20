@@ -46,6 +46,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dev.danny.sundial.AppContainer
 import dev.danny.sundial.auth.BrowserLauncher
 import dev.danny.sundial.core.EventItem
@@ -72,7 +73,12 @@ fun EventDetailScreen(
     var loading by remember { mutableStateOf(true) }
     var showDeleteDialog by remember { mutableStateOf(false) }
 
-    LaunchedEffect(calendarId, eventId, container.repository.changes.value) {
+    // Collected as snapshot state, not read as .value: a bare StateFlow.value read
+    // during composition never invalidates anything, so RSVP/sync changes were
+    // invisible until the screen was reopened.
+    val changeStamp by container.repository.changes.collectAsStateWithLifecycle()
+
+    LaunchedEffect(calendarId, eventId, changeStamp) {
         event = container.repository.event(calendarId, eventId)
         loading = false
     }
@@ -202,7 +208,7 @@ private fun EventDetailBody(
             event.attendees.take(20).forEach { attendee ->
                 Text(
                     text = buildString {
-                        append(attendee.displayName ?: attendee.email)
+                        append(attendee.displayName ?: attendee.email.orEmpty())
                         attendee.responseStatus?.let { status ->
                             append(" · ")
                             append(

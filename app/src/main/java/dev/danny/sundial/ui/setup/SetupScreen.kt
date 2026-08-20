@@ -26,7 +26,6 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -38,8 +37,6 @@ import androidx.compose.ui.unit.dp
 import dev.danny.sundial.AppContainer
 import dev.danny.sundial.auth.BrowserLauncher
 import dev.danny.sundial.auth.SignInStatus
-import dev.danny.sundial.sync.SyncScheduler
-import kotlinx.coroutines.launch
 
 private const val CONSOLE_URL = "https://console.cloud.google.com/apis/credentials"
 
@@ -51,7 +48,6 @@ private const val CONSOLE_URL = "https://console.cloud.google.com/apis/credentia
 @Composable
 fun SetupScreen(container: AppContainer) {
     val context = LocalContext.current
-    val scope = rememberCoroutineScope()
 
     var clientId by remember { mutableStateOf(container.auth.clientId.orEmpty()) }
     var clientSecret by remember { mutableStateOf(container.auth.clientSecret.orEmpty()) }
@@ -67,12 +63,11 @@ fun SetupScreen(container: AppContainer) {
     val error = latestError?.takeIf { it != dismissedError }
 
     LaunchedEffect(signInStatus) {
-        val done = signInStatus
-        if (done is SignInStatus.Success) {
-            SyncScheduler.ensurePeriodic(context, container.prefs.syncIntervalMinutes)
-            SyncScheduler.syncNow(context)
-            container.auth.clearSignInStatus()
-        }
+        // Sync scheduling on sign-in lives in AppContainer: this screen leaves the
+        // composition in the same frame signedIn flips, so an effect here is disposed
+        // before it runs. All that remains is retiring a finished Success — and if
+        // that races the screen swap, the stale status is cleared on the next mount.
+        if (signInStatus is SignInStatus.Success) container.auth.clearSignInStatus()
     }
 
     Scaffold { padding ->
@@ -166,8 +161,11 @@ fun SetupScreen(container: AppContainer) {
             Button(
                 onClick = {
                     dismissedError = null
-                    container.auth.saveClientCredentials(clientId, clientSecret)
-                    container.auth.beginSignIn()
+                    // A refused save surfaces through signInStatus; starting the flow
+                    // anyway would run it against the previously stored credentials.
+                    if (container.auth.saveClientCredentials(clientId, clientSecret)) {
+                        container.auth.beginSignIn()
+                    }
                 },
                 enabled = !busy && clientId.isNotBlank() && clientSecret.isNotBlank(),
                 modifier = Modifier.fillMaxWidth(),

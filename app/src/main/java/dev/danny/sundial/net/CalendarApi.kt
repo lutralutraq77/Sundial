@@ -175,12 +175,17 @@ class CalendarApi(private val auth: AuthRepository) {
                 continue
             }
             if (code == 401) {
+                // A freshly refreshed token was still rejected: the session is dead.
+                // Telling the repository is what actually returns the user to the
+                // setup screen — nothing downstream acts on requiresReauth alone.
+                auth.sessionRejected()
                 throw AuthException("Google rejected the access token.", requiresReauth = true)
             }
             if (code in tolerate) return@withContext payload
             if (code !in 200..299) throw errorFor(code, payload)
             return@withContext payload
         }
+        auth.sessionRejected()
         throw AuthException("Google rejected the access token.", requiresReauth = true)
     }
 

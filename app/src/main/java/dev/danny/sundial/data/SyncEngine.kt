@@ -33,6 +33,13 @@ class SyncEngine(
         withContext(Dispatchers.IO) { runSync() }
     }
 
+    /**
+     * Runs [block] with the sync lock held. Sign-out cleanup uses this so a sync in
+     * flight cannot re-insert the old account's fetched events after the wipe — the
+     * sync aborts quickly once the tokens are gone, so the wait is short.
+     */
+    suspend fun <T> withSyncLock(block: suspend () -> T): T = mutex.withLock { block() }
+
     private suspend fun runSync(): SyncOutcome {
         val startedAt = System.currentTimeMillis()
 

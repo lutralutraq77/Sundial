@@ -49,6 +49,110 @@ object IcsParser {
     private val BASIC_DATE_TIME: DateTimeFormatter = DateTimeFormatter.ofPattern("yyyyMMdd'T'HHmmss")
     private val BASIC_DATE: DateTimeFormatter = DateTimeFormatter.ofPattern("yyyyMMdd")
 
+    /** Resolve a TZID to a usable zone: IANA directly, else the Windows-name table Outlook exports use. */
+    internal fun resolveZone(tzid: String): ZoneId? =
+        runCatching { ZoneId.of(tzid.trim()) }.getOrNull()
+            ?: WINDOWS_ZONES[tzid.trim()]?.let { ZoneId.of(it) }
+
+    /**
+     * CLDR windowsZones mapping (territory 001) for the zone names Outlook/Exchange
+     * emit as TZIDs. Full VTIMEZONE parsing is deliberately out of scope — real-world
+     * non-IANA TZIDs are almost always exactly these Windows names.
+     */
+    private val WINDOWS_ZONES: Map<String, String> = mapOf(
+        "Dateline Standard Time" to "Etc/GMT+12",
+        "Hawaiian Standard Time" to "Pacific/Honolulu",
+        "Alaskan Standard Time" to "America/Anchorage",
+        "Pacific Standard Time" to "America/Los_Angeles",
+        "Pacific Standard Time (Mexico)" to "America/Tijuana",
+        "US Mountain Standard Time" to "America/Phoenix",
+        "Mountain Standard Time" to "America/Denver",
+        "Mountain Standard Time (Mexico)" to "America/Mazatlan",
+        "Central America Standard Time" to "America/Guatemala",
+        "Central Standard Time" to "America/Chicago",
+        "Central Standard Time (Mexico)" to "America/Mexico_City",
+        "Canada Central Standard Time" to "America/Regina",
+        "SA Pacific Standard Time" to "America/Bogota",
+        "Eastern Standard Time" to "America/New_York",
+        "Eastern Standard Time (Mexico)" to "America/Cancun",
+        "US Eastern Standard Time" to "America/Indianapolis",
+        "Venezuela Standard Time" to "America/Caracas",
+        "Paraguay Standard Time" to "America/Asuncion",
+        "Atlantic Standard Time" to "America/Halifax",
+        "Central Brazilian Standard Time" to "America/Cuiaba",
+        "SA Western Standard Time" to "America/La_Paz",
+        "Newfoundland Standard Time" to "America/St_Johns",
+        "E. South America Standard Time" to "America/Sao_Paulo",
+        "Argentina Standard Time" to "America/Buenos_Aires",
+        "SA Eastern Standard Time" to "America/Cayenne",
+        "Greenland Standard Time" to "America/Godthab",
+        "Montevideo Standard Time" to "America/Montevideo",
+        "Azores Standard Time" to "Atlantic/Azores",
+        "Cape Verde Standard Time" to "Atlantic/Cape_Verde",
+        "UTC" to "Etc/UTC",
+        "GMT Standard Time" to "Europe/London",
+        "Greenwich Standard Time" to "Atlantic/Reykjavik",
+        "Morocco Standard Time" to "Africa/Casablanca",
+        "W. Europe Standard Time" to "Europe/Berlin",
+        "Central Europe Standard Time" to "Europe/Budapest",
+        "Romance Standard Time" to "Europe/Paris",
+        "Central European Standard Time" to "Europe/Warsaw",
+        "W. Central Africa Standard Time" to "Africa/Lagos",
+        "GTB Standard Time" to "Europe/Bucharest",
+        "Middle East Standard Time" to "Asia/Beirut",
+        "Egypt Standard Time" to "Africa/Cairo",
+        "E. Europe Standard Time" to "Europe/Chisinau",
+        "Syria Standard Time" to "Asia/Damascus",
+        "South Africa Standard Time" to "Africa/Johannesburg",
+        "FLE Standard Time" to "Europe/Kiev",
+        "Turkey Standard Time" to "Europe/Istanbul",
+        "Israel Standard Time" to "Asia/Jerusalem",
+        "Jordan Standard Time" to "Asia/Amman",
+        "Arabic Standard Time" to "Asia/Baghdad",
+        "Kaliningrad Standard Time" to "Europe/Kaliningrad",
+        "Arab Standard Time" to "Asia/Riyadh",
+        "E. Africa Standard Time" to "Africa/Nairobi",
+        "Iran Standard Time" to "Asia/Tehran",
+        "Arabian Standard Time" to "Asia/Dubai",
+        "Azerbaijan Standard Time" to "Asia/Baku",
+        "Russian Standard Time" to "Europe/Moscow",
+        "Mauritius Standard Time" to "Indian/Mauritius",
+        "Georgian Standard Time" to "Asia/Tbilisi",
+        "Caucasus Standard Time" to "Asia/Yerevan",
+        "Afghanistan Standard Time" to "Asia/Kabul",
+        "West Asia Standard Time" to "Asia/Tashkent",
+        "Pakistan Standard Time" to "Asia/Karachi",
+        "India Standard Time" to "Asia/Calcutta",
+        "Sri Lanka Standard Time" to "Asia/Colombo",
+        "Nepal Standard Time" to "Asia/Katmandu",
+        "Central Asia Standard Time" to "Asia/Almaty",
+        "Bangladesh Standard Time" to "Asia/Dhaka",
+        "Myanmar Standard Time" to "Asia/Rangoon",
+        "SE Asia Standard Time" to "Asia/Bangkok",
+        "N. Central Asia Standard Time" to "Asia/Novosibirsk",
+        "China Standard Time" to "Asia/Shanghai",
+        "North Asia Standard Time" to "Asia/Krasnoyarsk",
+        "Singapore Standard Time" to "Asia/Singapore",
+        "W. Australia Standard Time" to "Australia/Perth",
+        "Taipei Standard Time" to "Asia/Taipei",
+        "Ulaanbaatar Standard Time" to "Asia/Ulaanbaatar",
+        "North Asia East Standard Time" to "Asia/Irkutsk",
+        "Tokyo Standard Time" to "Asia/Tokyo",
+        "Korea Standard Time" to "Asia/Seoul",
+        "Yakutsk Standard Time" to "Asia/Yakutsk",
+        "Cen. Australia Standard Time" to "Australia/Adelaide",
+        "AUS Central Standard Time" to "Australia/Darwin",
+        "E. Australia Standard Time" to "Australia/Brisbane",
+        "AUS Eastern Standard Time" to "Australia/Sydney",
+        "West Pacific Standard Time" to "Pacific/Port_Moresby",
+        "Tasmania Standard Time" to "Australia/Hobart",
+        "Vladivostok Standard Time" to "Asia/Vladivostok",
+        "Central Pacific Standard Time" to "Pacific/Guadalcanal",
+        "New Zealand Standard Time" to "Pacific/Auckland",
+        "Fiji Standard Time" to "Pacific/Fiji",
+        "Tonga Standard Time" to "Pacific/Tongatapu",
+    )
+
     fun parse(text: String): IcsParseResult {
         val lines = unfold(text)
         val events = mutableListOf<IcsEvent>()
@@ -208,6 +312,9 @@ object IcsParser {
         val value = trigger?.value?.trim() ?: return null
         // Absolute triggers cannot be expressed as "minutes before" — skip them.
         if (trigger?.params?.get("VALUE").equals("DATE-TIME", ignoreCase = true)) return null
+        // End-relative triggers have no start-relative equivalent in Google's model
+        // (they usually land AFTER the start) — skip them rather than firing early.
+        if (trigger?.params?.get("RELATED").equals("END", ignoreCase = true)) return null
         if (action == "AUDIO" || action == "EMAIL" || action == null || action == "DISPLAY") {
             val minutes = parseDurationMinutes(value) ?: return null
             // Negative offsets are "before the event", which is the only thing Google takes.
@@ -242,7 +349,11 @@ object IcsParser {
         return when {
             utc -> IcsTimeValue(millis = local.toInstant(ZoneOffset.UTC).toEpochMilli(), zoneId = "UTC")
             tzid != null -> {
-                val zone = runCatching { ZoneId.of(tzid) }.getOrNull() ?: ZoneId.systemDefault()
+                // Unknown TZID: skip the event with a visible warning (parse() turns
+                // this into the warnings channel) instead of silently importing it at
+                // the device zone's wall-clock time.
+                val zone = resolveZone(tzid)
+                    ?: throw IllegalArgumentException("unknown time zone \"$tzid\"")
                 IcsTimeValue(millis = local.atZone(zone).toInstant().toEpochMilli(), zoneId = zone.id)
             }
             // Floating time: interpret in the device's zone, as calendar clients do.
@@ -253,9 +364,15 @@ object IcsParser {
         }
     }
 
-    /** EXDATE/RDATE must keep their TZID parameter when handed to Google. */
+    /**
+     * EXDATE/RDATE must keep their TZID parameter when handed to Google — rewritten
+     * to the resolved IANA id, since Google rejects Windows zone names.
+     */
     private fun rebuildDateListLine(name: String, property: IcsProperty): String {
-        val params = property.params.entries.joinToString("") { ";${it.key}=${it.value}" }
+        val params = property.params.entries.joinToString("") { (key, value) ->
+            val rewritten = if (key == "TZID") resolveZone(value)?.id ?: value else value
+            ";$key=$rewritten"
+        }
         return "$name$params:${property.value.trim()}"
     }
 

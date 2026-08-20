@@ -2,6 +2,7 @@ package dev.danny.sundial.ui.calendar
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
@@ -25,13 +26,18 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.semantics.onClick
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
@@ -42,6 +48,7 @@ import dev.danny.sundial.core.EventItem
 import dev.danny.sundial.core.TimeUtil
 import dev.danny.sundial.ui.common.contrastOn
 import dev.danny.sundial.ui.common.parseHexColor
+import dev.danny.sundial.ui.common.rememberNow
 import java.time.DayOfWeek
 import java.time.LocalDate
 import java.time.LocalDateTime
@@ -98,10 +105,15 @@ fun TimeGridView(
     LaunchedEffect(targetPage, dayCount) {
         if (pagerState.currentPage != targetPage) pagerState.scrollToPage(targetPage)
     }
+    // rememberUpdatedState: this collect lambda outlives every recomposition, so a
+    // bare `anchor` read stays frozen at effect launch — swiping back to the original
+    // page then compared equal against the stale anchor and never fired onRangeChange,
+    // desyncing the title and loaded window from the visible days.
+    val currentAnchor by rememberUpdatedState(anchor)
     LaunchedEffect(pagerState, dayCount) {
         snapshotFlow { pagerState.settledPage }.collect { page ->
             val start = startOfPage(page)
-            if (pageOf(anchor) != page) onRangeChange(start)
+            if (pageOf(currentAnchor) != page) onRangeChange(start)
         }
     }
 
@@ -141,7 +153,7 @@ fun TimeGridView(
 
 @Composable
 private fun DayHeaderRow(days: List<LocalDate>) {
-    val today = TimeUtil.today()
+    val today = rememberNow().toLocalDate()
     Row(modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
         Box(modifier = Modifier.width(GUTTER_WIDTH))
         days.forEach { day ->
@@ -255,14 +267,33 @@ private fun DayColumn(
     modifier: Modifier = Modifier,
 ) {
     val positioned = remember(events, day) { positionEvents(events, day) }
-    val isToday = day == TimeUtil.today()
+    // Ticks each minute: the now-line tracks the clock and the today highlight
+    // flips at midnight instead of freezing at whatever composition computed.
+    val now = rememberNow()
+    val isToday = day == now.toLocalDate()
 
     BoxWithConstraints(
         modifier = modifier
             .height(HOUR_HEIGHT * 24)
-            .clickable {
-                // Tapping empty space creates an event at the top of the visible hour.
-                onCreateAt(day.atTime(9, 0))
+            .pointerInput(day) {
+                detectTapGestures { offset ->
+                    // Create at the tapped half-hour: the column is the full 24-hour
+                    // grid inside the shared scroll, so offset.y is already
+                    // minutes-since-midnight in content coordinates.
+                    val minutes = (offset.y / HOUR_HEIGHT.toPx() * 60).toInt()
+                    val snapped = (minutes / 30) * 30
+                    val clamped = snapped.coerceIn(0, 23 * 60 + 30)
+                    onCreateAt(day.atTime(clamped / 60, clamped % 60))
+                }
+            }
+            // pointerInput carries no semantics: without this, TalkBack and switch
+            // access lose tap-to-create entirely. A fixed default time is fine for
+            // the accessibility path — the editor shows and lets them change it.
+            .semantics {
+                onClick(label = "Create event") {
+                    onCreateAt(day.atTime(9, 0))
+                    true
+                }
             },
     ) {
         val columnWidth = maxWidth
@@ -295,7 +326,7 @@ private fun DayColumn(
         }
 
         if (isToday) {
-            val minutes = LocalTime.now().hour * 60 + LocalTime.now().minute
+            val minutes = now.hour * 60 + now.minute
             Box(
                 modifier = Modifier
                     .offset(y = HOUR_HEIGHT * (minutes / 60f))
@@ -357,7 +388,11 @@ fun positionEvents(events: List<EventItem>, day: LocalDate): List<PositionedEven
             val end = minOf(event.endMillis, dayEnd)
             if (end <= start) return@mapNotNull null
             val startMinute = ((start - dayStart) / 60_000L).toInt().coerceIn(0, 1439)
-            val endMinute = ((end - dayStart) / 60_000L).toInt().coerceIn(startMinute + 15, 1440)
+            // The 15-minute floor must never push the range past the end of the day:
+            // coerceIn throws when min > max, so an event starting 23:46+ crashed the
+            // whole grid during composition.
+            val endMinute = ((end - dayStart) / 60_000L).toInt()
+                .coerceIn(minOf(startMinute + 15, 1440), 1440)
             Span(event, startMinute, endMinute)
         }
         .sortedWith(compareBy({ it.start }, { -it.end }))

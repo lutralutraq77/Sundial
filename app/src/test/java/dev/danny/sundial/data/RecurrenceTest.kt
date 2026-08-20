@@ -96,8 +96,34 @@ class RecurrenceTest {
         val updated = Recurrence.withUntil(
             listOf("RRULE:FREQ=DAILY;COUNT=5"),
             LocalDate.of(2026, 12, 1),
+            zone = java.time.ZoneOffset.UTC,
+            allDay = false,
         )
         assertEquals(listOf("RRULE:FREQ=DAILY;UNTIL=20261201T235959Z"), updated)
+    }
+
+    @Test
+    fun `withUntil anchors the stamp in the event's own zone`() {
+        // End of 1 Dec in Los Angeles is 07:59:59Z on 2 Dec — a bare local stamp
+        // would drop the final occurrence for every zone west of UTC.
+        val updated = Recurrence.withUntil(
+            listOf("RRULE:FREQ=DAILY"),
+            LocalDate.of(2026, 12, 1),
+            zone = java.time.ZoneId.of("America/Los_Angeles"),
+            allDay = false,
+        )
+        assertEquals(listOf("RRULE:FREQ=DAILY;UNTIL=20261202T075959Z"), updated)
+    }
+
+    @Test
+    fun `withUntil uses a bare date for all-day events`() {
+        val updated = Recurrence.withUntil(
+            listOf("RRULE:FREQ=WEEKLY"),
+            LocalDate.of(2026, 12, 1),
+            zone = java.time.ZoneOffset.UTC,
+            allDay = true,
+        )
+        assertEquals(listOf("RRULE:FREQ=WEEKLY;UNTIL=20261201"), updated)
     }
 
     @Test

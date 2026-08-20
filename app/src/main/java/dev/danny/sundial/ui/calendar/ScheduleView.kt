@@ -18,7 +18,10 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
@@ -26,6 +29,8 @@ import androidx.compose.ui.unit.dp
 import dev.danny.sundial.core.EventItem
 import dev.danny.sundial.core.TimeUtil
 import dev.danny.sundial.ui.common.EmptyState
+import dev.danny.sundial.ui.common.rememberNow
+import kotlinx.coroutines.delay
 import java.time.LocalDate
 
 /**
@@ -57,13 +62,33 @@ fun ScheduleView(
     }
 
     val listState = rememberLazyListState()
-    val firstIndexAtOrAfterAnchor = remember(days, anchor) {
-        days.indexOfFirst { !it.first.isBefore(anchor) }.coerceAtLeast(0)
-    }
 
-    LaunchedEffect(firstIndexAtOrAfterAnchor, days.size) {
-        if (firstIndexAtOrAfterAnchor in days.indices) {
-            listState.scrollToItem(firstIndexAtOrAfterAnchor)
+    // Reposition for explicit navigation (today, date picks) but never for a
+    // sync/reload changing the day count under a user who has scrolled elsewhere.
+    // An anchor change also starts a reload whose window lands a frame or two
+    // later, so a single blind scroll would position against stale data and never
+    // correct: keep trying until the loaded window actually covers the anchor,
+    // with the second attempt (the post-reload data) as the backstop.
+    var positionedFor by remember { mutableStateOf<LocalDate?>(null) }
+    var attemptsForAnchor by remember(anchor) { mutableStateOf(0) }
+    LaunchedEffect(anchor, days) {
+        if (positionedFor == anchor) return@LaunchedEffect
+        val index = days.indexOfFirst { !it.first.isBefore(anchor) }
+            // All loaded days before the anchor: the nearest day is the LAST one.
+            .let { if (it >= 0) it else days.lastIndex }
+        if (index in days.indices) listState.scrollToItem(index)
+        val covers = !days.first().first.isAfter(anchor) && !days.last().first.isBefore(anchor)
+        if (covers || attemptsForAnchor >= 1) {
+            positionedFor = anchor
+        } else {
+            attemptsForAnchor++
+            // The anchor's own reload lands within a frame or two (restarting this
+            // effect for the real second attempt). If it never does — identical
+            // data, or an anchor no loaded window can cover, e.g. only future
+            // events — stop waiting: an armed reposition must not survive to yank
+            // the list when a sync changes the day count hours later.
+            delay(2_000)
+            positionedFor = anchor
         }
     }
 
@@ -88,7 +113,7 @@ fun ScheduleView(
 
 @Composable
 private fun ScheduleDayHeader(date: LocalDate) {
-    val isToday = date == TimeUtil.today()
+    val isToday = date == rememberNow().toLocalDate()
     Row(
         modifier = Modifier
             .fillMaxWidth()

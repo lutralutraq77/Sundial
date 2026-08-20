@@ -1,6 +1,7 @@
 package dev.danny.sundial.ui.importer
 
 import android.net.Uri
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Box
@@ -42,11 +43,12 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dev.danny.sundial.AppContainer
+import dev.danny.sundial.ImportRun
 import dev.danny.sundial.core.CalendarInfo
 import dev.danny.sundial.core.TimeUtil
 import dev.danny.sundial.ics.ImportPreview
-import dev.danny.sundial.ics.ImportResult
 import dev.danny.sundial.ui.common.ColorDot
 import dev.danny.sundial.ui.common.parseHexColor
 import kotlinx.coroutines.Dispatchers
@@ -68,13 +70,19 @@ fun ImportScreen(
     var targetCalendarId by remember { mutableStateOf<String?>(null) }
     var parseError by remember { mutableStateOf<String?>(null) }
     var busy by remember { mutableStateOf(false) }
-    var progress by remember { mutableStateOf(0 to 0) }
-    var result by remember { mutableStateOf<ImportResult?>(null) }
+
+    // The import itself lives in AppContainer's scope and its progress/result in
+    // this flow, so a recreated screen (rotation, process pressure) re-attaches to
+    // the in-flight import instead of resetting to the file picker.
+    val importRun by container.importRun.collectAsStateWithLifecycle()
+    val importing = importRun is ImportRun.Running
+    val progress = (importRun as? ImportRun.Running)?.let { it.done to it.total } ?: (0 to 0)
+    val result = (importRun as? ImportRun.Finished)?.result
 
     suspend fun load(uri: Uri) {
         busy = true
         parseError = null
-        result = null
+        container.clearImportRun()
         val text = withContext(Dispatchers.IO) {
             runCatching {
                 context.contentResolver.openInputStream(uri)?.use { stream ->
@@ -102,12 +110,16 @@ fun ImportScreen(
         initialUri?.let { load(it) }
     }
 
+    // The import itself survives leaving the screen (it runs in the container's
+    // scope), but the user should stay to see the result — hold Back while busy.
+    BackHandler(enabled = busy || importing) {}
+
     Scaffold(
         topBar = {
             TopAppBar(
                 title = { Text("Import .ics") },
                 navigationIcon = {
-                    IconButton(onClick = onBack) {
+                    IconButton(onClick = onBack, enabled = !busy && !importing) {
                         Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
                     }
                 },
@@ -127,7 +139,7 @@ fun ImportScreen(
                         arrayOf("text/calendar", "text/x-vcalendar", "application/octet-stream", "*/*"),
                     )
                 },
-                enabled = !busy,
+                enabled = !busy && !importing,
                 modifier = Modifier.fillMaxWidth(),
             ) {
                 Icon(Icons.Default.FileOpen, contentDescription = null, modifier = Modifier.size(18.dp))
@@ -145,6 +157,23 @@ fun ImportScreen(
                 Box(modifier = Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
                     CircularProgressIndicator()
                 }
+            }
+
+            // A recreated screen re-attaching to an in-flight import has no preview;
+            // the progress must not depend on one.
+            if (importing && preview == null) {
+                Spacer(Modifier.height(24.dp))
+                LinearProgressIndicator(
+                    progress = {
+                        if (progress.second == 0) 0f else progress.first.toFloat() / progress.second
+                    },
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                Text(
+                    text = "Importing ${progress.first} of ${progress.second}…",
+                    style = MaterialTheme.typography.bodySmall,
+                    modifier = Modifier.padding(top = 8.dp),
+                )
             }
 
             val current = preview
@@ -175,7 +204,13 @@ fun ImportScreen(
                     }
                 }
                 Spacer(Modifier.height(16.dp))
-                Button(onClick = onBack, modifier = Modifier.fillMaxWidth()) { Text("Done") }
+                Button(
+                    onClick = {
+                        container.clearImportRun()
+                        onBack()
+                    },
+                    modifier = Modifier.fillMaxWidth(),
+                ) { Text("Done") }
             } else if (current != null) {
                 Spacer(Modifier.height(20.dp))
                 Text(
@@ -261,7 +296,7 @@ fun ImportScreen(
 
                 Spacer(Modifier.height(20.dp))
 
-                if (busy) {
+                if (importing) {
                     LinearProgressIndicator(
                         progress = {
                             if (progress.second == 0) 0f else progress.first.toFloat() / progress.second
@@ -277,16 +312,7 @@ fun ImportScreen(
                     Button(
                         onClick = {
                             val target = targetCalendarId ?: return@Button
-                            busy = true
-                            progress = 0 to current.importable.size
-                            scope.launch {
-                                result = container.importer.import(
-                                    events = current.importable,
-                                    calendarId = target,
-                                    onProgress = { done, total -> progress = done to total },
-                                )
-                                busy = false
-                            }
+                            container.runImport(current.importable, target)
                         },
                         enabled = targetCalendarId != null && current.importable.isNotEmpty(),
                         modifier = Modifier.fillMaxWidth(),

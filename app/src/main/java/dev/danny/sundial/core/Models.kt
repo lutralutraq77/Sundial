@@ -22,7 +22,8 @@ data class CalendarInfo(
 }
 
 data class Attendee(
-    val email: String,
+    /** Null for entries Google sends without an address (rooms, contact-only guests). */
+    val email: String?,
     val displayName: String?,
     val responseStatus: String?,
     val self: Boolean,
@@ -63,6 +64,8 @@ data class EventItem(
     val updatedMillis: Long,
     /** Colour resolved from the event override or its calendar; "#RRGGBB". */
     val colorHex: String,
+    /** False when the event is marked free (transparency = "transparent"). */
+    val busy: Boolean = true,
 ) {
     val isRecurring: Boolean get() = recurringEventId != null || recurrence.isNotEmpty()
 

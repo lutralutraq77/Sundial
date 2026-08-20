@@ -47,7 +47,10 @@ fun SundialRoot(
 ) {
     val authState by container.auth.state.collectAsStateWithLifecycle()
 
-    if (!authState.signedIn) {
+    // hasCredentials matters too: keys are dropped from the secure store one at a
+    // time, so "signed in" with the client secret gone is reachable — and without
+    // this check the setup screen would be unreachable in exactly that state.
+    if (!authState.signedIn || !authState.hasCredentials) {
         SetupScreen(container = container)
         return
     }

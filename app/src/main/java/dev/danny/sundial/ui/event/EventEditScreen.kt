@@ -233,6 +233,19 @@ private fun EditForm(
             onTimeChange = { time -> onChange { it.copy(end = it.end.with(time)) } },
         )
 
+        // The pickers show wall times in the EVENT's zone (that is what a save
+        // re-anchors), while every other screen shows the device zone — without this
+        // label a cross-zone event's editor looks simply wrong.
+        val draftZone = TimeUtil.safeZone(draft.zoneId)
+        if (!draft.allDay && draftZone != java.time.ZoneId.systemDefault()) {
+            Text(
+                text = "Times shown in ${draftZone.id}",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(top = 4.dp),
+            )
+        }
+
         HorizontalDivider(modifier = Modifier.padding(vertical = 12.dp))
 
         // ---- calendar ----

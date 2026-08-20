@@ -114,6 +114,16 @@ class CalendarRepository(
                 // is the *first* occurrence — patching it with this instance's times would
                 // shift the whole series. Fetch it and apply the user's delta instead.
                 val master = api.event(draft.calendarId, seriesId!!)
+                // seriesPatch can only re-anchor timing within the master's own
+                // representation; a timed<->all-day flip has no per-occurrence
+                // equivalent and used to be dropped silently.
+                val masterAllDay = master.start?.date != null
+                if (draft.allDay != masterAllDay) {
+                    throw IllegalArgumentException(
+                        "Switching between all-day and timed can't be applied to the " +
+                            "whole series. Save it for this event only.",
+                    )
+                }
                 val body = seriesPatch(draft, original, master)
                 api.patchEvent(draft.calendarId, seriesId, body, notify)
 
@@ -198,15 +208,30 @@ class CalendarRepository(
     suspend fun respond(event: EventItem, response: String): Result<EventItem> =
         withContext(Dispatchers.IO) {
             runCatching {
-                val attendees = event.attendees.map { attendee ->
-                    val status = if (attendee.self) response else attendee.responseStatus
-                    attendee.email to status
+                // events.patch replaces the attendees array wholesale — and Google
+                // cannot store an attendee without an address, so an event carrying
+                // one cannot be written back without silently removing that guest
+                // for everyone. Refuse rather than mutate the guest list.
+                if (event.attendees.any { it.email == null }) {
+                    throw IllegalStateException(
+                        "This event has a guest without an email address; responding " +
+                            "from Sundial would remove them. Respond from Google " +
+                            "Calendar instead.",
+                    )
                 }
+                // Every field the cache holds must be written back or Google resets it.
                 val body = buildJsonObject {
                     putJsonArray("attendees") {
-                        attendees.forEach { (email, status) ->
+                        event.attendees.forEach { attendee ->
+                            // Google cannot store an attendee without an address, so one
+                            // it sent email-less cannot be written back; fabricating an
+                            // address fails the whole PATCH with "Invalid attendee email".
+                            val email = attendee.email ?: return@forEach
                             addJsonObject {
                                 put("email", email)
+                                attendee.displayName?.let { put("displayName", it) }
+                                if (attendee.optional) put("optional", true)
+                                val status = if (attendee.self) response else attendee.responseStatus
                                 status?.let { put("responseStatus", it) }
                             }
                         }

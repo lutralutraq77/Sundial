@@ -353,4 +353,86 @@ class IcsParserTest {
         assertNotNull(event.startMillis)
         assertTrue(event.recurrence.single().startsWith("RRULE:FREQ=WEEKLY"))
     }
+
+    @Test
+    fun `resolves Windows TZIDs from Outlook exports`() {
+        val ics = wrap(
+            """
+            BEGIN:VEVENT
+            UID:outlook-1
+            DTSTART;TZID=W. Europe Standard Time:20260901T140000
+            DTEND;TZID=W. Europe Standard Time:20260901T150000
+            SUMMARY:Outlook meeting
+            END:VEVENT
+            """.trimIndent(),
+        )
+
+        val event = IcsParser.parse(ics).events.single()
+        assertEquals("Europe/Berlin", event.timeZone)
+        val expected = ZonedDateTime.of(2026, 9, 1, 14, 0, 0, 0, ZoneId.of("Europe/Berlin"))
+        assertEquals(expected.toInstant().toEpochMilli(), event.startMillis)
+    }
+
+    @Test
+    fun `skips an event with an unknown TZID instead of importing it at the wrong time`() {
+        val ics = wrap(
+            """
+            BEGIN:VEVENT
+            UID:custom-tz
+            DTSTART;TZID=My Custom Zone:20260901T140000
+            SUMMARY:Wrong zone
+            END:VEVENT
+            """.trimIndent(),
+        )
+
+        val result = IcsParser.parse(ics)
+        assertTrue(result.events.isEmpty())
+        assertTrue(result.warnings.single(), result.warnings.single().contains("My Custom Zone"))
+    }
+
+    @Test
+    fun `rewrites Windows TZIDs in EXDATE lines to IANA ids`() {
+        val ics = wrap(
+            """
+            BEGIN:VEVENT
+            UID:exdate-1
+            DTSTART;TZID=Pacific Standard Time:20260901T090000
+            RRULE:FREQ=DAILY
+            EXDATE;TZID=Pacific Standard Time:20260902T090000
+            SUMMARY:Daily thing
+            END:VEVENT
+            """.trimIndent(),
+        )
+
+        val event = IcsParser.parse(ics).events.single()
+        val exdate = event.recurrence.single { it.startsWith("EXDATE") }
+        assertTrue(exdate, exdate.contains("TZID=America/Los_Angeles"))
+    }
+
+    @Test
+    fun `skips end-relative alarm triggers`() {
+        val ics = wrap(
+            """
+            BEGIN:VEVENT
+            UID:alarm-end
+            DTSTART:20260901T140000Z
+            DTEND:20260901T160000Z
+            SUMMARY:Long meeting
+            BEGIN:VALARM
+            ACTION:DISPLAY
+            TRIGGER;RELATED=END:-PT15M
+            END:VALARM
+            BEGIN:VALARM
+            ACTION:DISPLAY
+            TRIGGER:-PT10M
+            END:VALARM
+            END:VEVENT
+            """.trimIndent(),
+        )
+
+        val event = IcsParser.parse(ics).events.single()
+        // Only the start-relative alarm survives; the end-relative one has no
+        // equivalent in Google's minutes-before-start model.
+        assertEquals(listOf(10), event.reminderMinutes)
+    }
 }

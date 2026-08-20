@@ -2,6 +2,7 @@ package dev.danny.sundial.auth
 
 import java.io.BufferedReader
 import java.io.Closeable
+import java.io.IOException
 import java.io.InputStreamReader
 import java.net.InetAddress
 import java.net.ServerSocket
@@ -14,8 +15,13 @@ import java.net.URLDecoder
  * Using a loopback redirect instead of a custom URI scheme means the client ID is not
  * baked into the APK at build time — it can be entered at runtime, and the same build
  * works with any Google Cloud project.
+ *
+ * The port is reachable by every local app with the INTERNET permission, and browsers
+ * open speculative connections that never send a request. So only a request that
+ * carries the OAuth outcome for [expectedState] may end the wait — anything else is
+ * answered and the server keeps listening.
  */
-class LoopbackServer : Closeable {
+class LoopbackServer(private val expectedState: String? = null) : Closeable {
 
     private val server = ServerSocket(0, 4, InetAddress.getByName("127.0.0.1"))
 
@@ -24,24 +30,46 @@ class LoopbackServer : Closeable {
     val redirectUri: String = "http://127.0.0.1:$port"
 
     /**
-     * Blocks until the browser requests the redirect URI and returns its query
-     * parameters. Throws when [close] is called first, which is how cancellation works.
+     * Blocks until the browser requests the redirect URI with an OAuth response and
+     * returns its query parameters. Throws when [close] is called first, which is how
+     * cancellation works.
      */
     fun awaitRedirect(): Map<String, String> {
         while (true) {
             val socket = server.accept()
             try {
+                // A connection that sends nothing (browser preconnect) must not block
+                // the real redirect behind it in the accept queue.
+                socket.soTimeout = SOCKET_READ_TIMEOUT_MS
                 val reader = BufferedReader(InputStreamReader(socket.getInputStream(), Charsets.UTF_8))
                 val requestLine = reader.readLine() ?: continue
                 val target = requestLine.split(' ').getOrNull(1) ?: "/"
-                if (target.startsWith("/favicon")) {
-                    write(socket, "404 Not Found", "text/plain", "")
+                val params = parseQuery(target)
+
+                // Only Google's redirect for THIS attempt ends the wait: it carries a
+                // code or an error, and (when a state is expected) the matching state.
+                // Favicon probes, stray requests and other local apps get a 404 —
+                // they must not consume the one-shot server. A process that does not
+                // know the state value can never terminate the flow.
+                val isRedirect = (params.containsKey("code") || params.containsKey("error")) &&
+                    (expectedState == null || params["state"] == expectedState)
+                if (!isRedirect) {
+                    runCatching { write(socket, "404 Not Found", "text/plain", "") }
                     continue
                 }
-                val params = parseQuery(target)
+
                 val page = if (params.containsKey("code")) successPage() else errorPage(params)
-                write(socket, "200 OK", "text/html; charset=utf-8", page)
+                // The params are already in hand — a dead socket (the browser gave up
+                // while this process was frozen) must not turn Google's approval into
+                // a failed sign-in. The confirmation page is best-effort.
+                runCatching { write(socket, "200 OK", "text/html; charset=utf-8", page) }
                 return params
+            } catch (_: IOException) {
+                // Idle connection timing out, or a peer that aborted with RST mid-read
+                // (a cancelled browser preconnect, a port scanner, any local app): a
+                // bad client connection must never end the wait — that is the same
+                // stray-request hole the code/state filtering closes. Only accept()
+                // failing (our own socket closed = cancellation) may throw out.
             } finally {
                 runCatching { socket.close() }
             }
@@ -147,5 +175,7 @@ class LoopbackServer : Closeable {
         /** Handled by MainActivity's sundial:// intent filter. */
         const val RETURN_INTENT_URI =
             "intent://returned#Intent;scheme=sundial;package=dev.danny.sundial;end"
+
+        const val SOCKET_READ_TIMEOUT_MS = 3_000
     }
 }

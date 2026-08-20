@@ -107,9 +107,16 @@ fun SearchScreen(
                         TextButton(
                             onClick = {
                                 loading = true
+                                // Snapshot the query: this job survives edits, and a
+                                // slow remote result must not overwrite the fresher
+                                // local results of whatever the user typed since.
+                                val searched = query
                                 scope.launch {
-                                    results = container.repository.searchRemote(query)
-                                    searchedRemotely = true
+                                    val remote = container.repository.searchRemote(searched)
+                                    if (query == searched) {
+                                        results = remote
+                                        searchedRemotely = true
+                                    }
                                     loading = false
                                 }
                             },

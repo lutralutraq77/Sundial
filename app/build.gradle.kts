@@ -23,8 +23,8 @@ android {
         applicationId = "dev.danny.sundial"
         minSdk = 29
         targetSdk = 35
-        versionCode = 6
-        versionName = "1.1.2"
+        versionCode = 8
+        versionName = "1.3.0"
         resourceConfigurations += listOf("en")
     }
 

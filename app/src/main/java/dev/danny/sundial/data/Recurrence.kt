@@ -2,6 +2,8 @@ package dev.danny.sundial.data
 
 import java.time.DayOfWeek
 import java.time.LocalDate
+import java.time.ZoneId
+import java.time.ZoneOffset
 import java.time.format.TextStyle
 import java.util.Locale
 
@@ -96,11 +98,26 @@ object Recurrence {
         stripEnding(rule) + ";COUNT=$count"
     }
 
-    fun withUntil(rules: List<String>, until: LocalDate): List<String> = rules.map { rule ->
-        if (!rule.startsWith("RRULE", ignoreCase = true)) return@map rule
-        val stamp = "%04d%02d%02dT235959Z".format(until.year, until.monthValue, until.dayOfMonth)
-        stripEnding(rule) + ";UNTIL=$stamp"
-    }
+    /**
+     * RFC 5545: UNTIL's value type must match DTSTART's — a bare date for all-day
+     * events, a UTC instant for timed ones. The instant is the end of [until] in the
+     * event's own [zone]; stamping local midnight as if it were UTC dropped the final
+     * occurrence in every zone west of UTC.
+     */
+    fun withUntil(rules: List<String>, until: LocalDate, zone: ZoneId, allDay: Boolean): List<String> =
+        rules.map { rule ->
+            if (!rule.startsWith("RRULE", ignoreCase = true)) return@map rule
+            val stamp = if (allDay) {
+                "%04d%02d%02d".format(until.year, until.monthValue, until.dayOfMonth)
+            } else {
+                val utc = until.plusDays(1).atStartOfDay(zone).minusSeconds(1)
+                    .withZoneSameInstant(ZoneOffset.UTC)
+                "%04d%02d%02dT%02d%02d%02dZ".format(
+                    utc.year, utc.monthValue, utc.dayOfMonth, utc.hour, utc.minute, utc.second,
+                )
+            }
+            stripEnding(rule) + ";UNTIL=$stamp"
+        }
 
     fun withInterval(rules: List<String>, interval: Int): List<String> = rules.map { rule ->
         if (!rule.startsWith("RRULE", ignoreCase = true)) return@map rule

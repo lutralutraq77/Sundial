@@ -23,7 +23,9 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -38,6 +40,7 @@ import dev.danny.sundial.core.EventItem
 import dev.danny.sundial.core.TimeUtil
 import dev.danny.sundial.ui.common.contrastOn
 import dev.danny.sundial.ui.common.parseHexColor
+import dev.danny.sundial.ui.common.rememberNow
 import java.time.DayOfWeek
 import java.time.LocalDate
 import java.time.YearMonth
@@ -70,10 +73,15 @@ fun MonthView(
     LaunchedEffect(targetPage) {
         if (pagerState.currentPage != targetPage) pagerState.scrollToPage(targetPage)
     }
+    // rememberUpdatedState: this collect lambda outlives every recomposition (its only
+    // key is the stable pagerState), so a bare `anchor` read stays frozen at the first
+    // composition's value — swiping back to a previously visited month then compared
+    // equal against the stale anchor and never fired onMonthChange.
+    val currentAnchor by rememberUpdatedState(anchor)
     LaunchedEffect(pagerState) {
         snapshotFlow { pagerState.settledPage }.collect { page ->
             val month = monthOf(page)
-            if (YearMonth.from(anchor) != month) {
+            if (YearMonth.from(currentAnchor) != month) {
                 val today = TimeUtil.today()
                 onMonthChange(if (YearMonth.from(today) == month) today else month.atDay(1))
             }
@@ -137,7 +145,7 @@ private fun MonthGrid(
     val gridStart = remember(month, firstDayOfWeek) {
         DateGrid.monthGridStart(month.atDay(1), firstDayOfWeek)
     }
-    val today = TimeUtil.today()
+    val today = rememberNow().toLocalDate()
 
     Column(modifier = Modifier.fillMaxSize()) {
         repeat(6) { week ->

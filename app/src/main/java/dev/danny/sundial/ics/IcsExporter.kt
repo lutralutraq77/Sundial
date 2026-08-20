@@ -3,6 +3,7 @@ package dev.danny.sundial.ics
 import dev.danny.sundial.core.EventItem
 import dev.danny.sundial.core.TimeUtil
 import java.time.Instant
+import java.time.ZoneId
 import java.time.ZoneOffset
 import java.time.format.DateTimeFormatter
 
@@ -14,6 +15,9 @@ object IcsExporter {
 
     private val DATE_STAMP: DateTimeFormatter =
         DateTimeFormatter.ofPattern("yyyyMMdd").withZone(ZoneOffset.UTC)
+
+    private val LOCAL_STAMP: DateTimeFormatter =
+        DateTimeFormatter.ofPattern("yyyyMMdd'T'HHmmss")
 
     fun export(events: List<EventItem>, calendarName: String): String {
         val builder = StringBuilder()
@@ -35,8 +39,19 @@ object IcsExporter {
                 builder.appendLine("DTSTART;VALUE=DATE:${DATE_STAMP.format(start.atStartOfDay(ZoneOffset.UTC))}")
                 builder.appendLine("DTEND;VALUE=DATE:${DATE_STAMP.format(endExclusive.atStartOfDay(ZoneOffset.UTC))}")
             } else {
-                builder.appendLine("DTSTART:${UTC_STAMP.format(Instant.ofEpochMilli(event.startMillis))}")
-                builder.appendLine("DTEND:${UTC_STAMP.format(Instant.ofEpochMilli(event.endMillis))}")
+                // A recurring event's RRULE/EXDATE lines are zone-anchored, so its
+                // DTSTART must stay in that zone or BYDAY/EXDATE stop matching (and
+                // the weekly time drifts an hour across DST on re-import).
+                val zone = event.recurrence.takeIf { it.isNotEmpty() }
+                    ?.let { event.timeZone }
+                    ?.let { runCatching { ZoneId.of(it) }.getOrNull() }
+                if (zone != null) {
+                    builder.appendLine("DTSTART;TZID=${zone.id}:${LOCAL_STAMP.format(TimeUtil.zonedAt(event.startMillis, zone))}")
+                    builder.appendLine("DTEND;TZID=${zone.id}:${LOCAL_STAMP.format(TimeUtil.zonedAt(event.endMillis, zone))}")
+                } else {
+                    builder.appendLine("DTSTART:${UTC_STAMP.format(Instant.ofEpochMilli(event.startMillis))}")
+                    builder.appendLine("DTEND:${UTC_STAMP.format(Instant.ofEpochMilli(event.endMillis))}")
+                }
             }
 
             event.summary?.takeIf { it.isNotBlank() }?.let { builder.appendLine(fold("SUMMARY:${escape(it)}")) }
@@ -58,7 +73,10 @@ object IcsExporter {
         }
 
         builder.appendLine("END:VCALENDAR")
-        return builder.toString()
+        // RFC 5545 3.1 requires CRLF throughout; appendLine and fold() both emit LF,
+        // so one pass normalizes everything (escape() already turned literal newlines
+        // in event text into "\\n").
+        return builder.toString().replace("\n", "\r\n")
     }
 
     fun suggestedFileName(calendarName: String): String {
@@ -72,17 +90,32 @@ object IcsExporter {
         .replace(",", "\\,")
         .replace(";", "\\;")
 
-    /** RFC 5545 says content lines wrap at 75 octets with a leading space. */
+    /**
+     * RFC 5545 says content lines wrap at 75 octets with a leading space. The budget
+     * is counted in UTF-8 octets (not UTF-16 chars) and the walk is by code point, so
+     * a fold boundary can never split a surrogate pair mid-emoji.
+     */
     private fun fold(line: String): String {
-        if (line.length <= 73) return line
         val builder = StringBuilder()
         var index = 0
+        var octets = 0
+        var limit = 73
         while (index < line.length) {
-            val take = if (index == 0) 73 else 72
-            val end = minOf(index + take, line.length)
-            if (index > 0) builder.append("\r\n ")
-            builder.append(line, index, end)
-            index = end
+            val codePoint = line.codePointAt(index)
+            val size = when {
+                codePoint < 0x80 -> 1
+                codePoint < 0x800 -> 2
+                codePoint < 0x10000 -> 3
+                else -> 4
+            }
+            if (octets + size > limit) {
+                builder.append("\n ")
+                octets = 0
+                limit = 72
+            }
+            builder.appendCodePoint(codePoint)
+            octets += size
+            index += Character.charCount(codePoint)
         }
         return builder.toString()
     }

@@ -87,13 +87,12 @@ data class EventDraft(
         put("transparency", if (busy) "opaque" else "transparent")
         colorId?.let { put("colorId", it) }
 
-        if (attendeeEmails.isNotEmpty()) {
-            putJsonArray("attendees") {
-                attendeeEmails.filter { it.isNotBlank() }.forEach { email ->
-                    addJsonObject { put("email", email.trim()) }
-                }
-            }
-        }
+        // Deliberately no "attendees" key: the editor cannot change guests, and
+        // events.patch replaces the array wholesale — reconstructing it from
+        // [attendeeEmails] would silently drop email-less guests (rooms,
+        // contact-only entries) and every displayName/optional flag. Omitting the
+        // key leaves Google's guest list untouched. [attendeeEmails] still drives
+        // the sendUpdates decision in the repository.
     }
 
     companion object {
@@ -124,8 +123,13 @@ data class EventDraft(
                 start = event.firstDay().atStartOfDay()
                 end = event.lastDay().atStartOfDay()
             } else {
-                start = TimeUtil.toLocalDateTime(event.startMillis)
-                end = TimeUtil.toLocalDateTime(event.endMillis)
+                // Wall times must be derived in the event's own zone, because toJson()
+                // re-anchors them there on save. Deriving them in the device zone
+                // silently shifted a cross-zone event by the offset difference on any
+                // edit — even one that never touched the time.
+                val zone = TimeUtil.safeZone(event.timeZone)
+                start = TimeUtil.zonedAt(event.startMillis, zone).toLocalDateTime()
+                end = TimeUtil.zonedAt(event.endMillis, zone).toLocalDateTime()
             }
             return EventDraft(
                 calendarId = event.calendarId,
@@ -140,8 +144,8 @@ data class EventDraft(
                 recurrence = event.recurrence,
                 reminders = event.reminders,
                 colorId = event.colorId,
-                attendeeEmails = event.attendees.map { it.email },
-                busy = true,
+                attendeeEmails = event.attendees.mapNotNull { it.email },
+                busy = event.busy,
                 recurringEventId = event.recurringEventId,
             )
         }

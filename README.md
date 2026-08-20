@@ -93,6 +93,12 @@ this app depends on me. It takes about five minutes, once.
 
 5. Copy the **client ID** and **client secret** into Sundial's first screen.
 
+6. **At sign-in, tick the calendar checkbox.** Google's consent screen lists each
+   requested permission with its own checkbox, and it will happily complete sign-in
+   with the calendar one unticked. Sundial checks the granted scopes and refuses such
+   a sign-in with an explanation rather than landing you on a calendar that can never
+   load.
+
 The "client secret" of a desktop OAuth client is not actually a secret —
 [Google documents it](https://developers.google.com/identity/protocols/oauth2/native-app)
 as embedded in installed apps, and PKCE is what actually protects the flow. Sundial
@@ -123,8 +129,10 @@ keyPassword=...
 Without it the release build is produced unsigned and you will need to sign it yourself
 before Android will install it.
 
-Minification is deliberately off: this is a sideloaded personal build, and an unshrunk
-APK removes a whole class of keep-rule failures for a few extra megabytes.
+Release builds are minified with R8 — material-icons-extended alone is ~35 MB of icon
+classes without shrinking. The keep rules in `app/proguard-rules.pro` pin the
+kotlinx.serialization models (verified against the release `mapping.txt`: the OAuth
+`TokenResponse` and its serializer survive un-renamed).
 
 ---
 
@@ -133,8 +141,9 @@ APK removes a whole class of keep-rule failures for a few extra megabytes.
 Transfer the APK and open it, or `adb install -r app-release.apk`.
 
 At first launch the app asks for notification permission — decline it and reminders
-simply stay silent. `USE_EXACT_ALARM` is declared so reminders fire at the right minute;
-it is granted at install time and needs no prompt.
+simply stay silent. `USE_EXACT_ALARM` (Android 13+) and `SCHEDULE_EXACT_ALARM`
+(Android 12/12L) are declared so reminders fire at the right minute; both are granted
+at install time and need no prompt.
 
 ---
 
@@ -175,12 +184,13 @@ Verified on device:
   comes back `Error 401: invalid_client — The OAuth client was not found`, which is the
   correct response and proves everything up to Google's end works.
 
-Verified by unit test (36 tests, `gradlew testDebugUnitTest`):
+Verified by unit test (45 tests, `gradlew testDebugUnitTest`):
 
 - `LoopbackServerTest` runs the redirect server over real sockets: it captures the
-  authorization code, handles a denial from the consent screen, ignores the browser's
-  `/favicon.ico` probe without ending the flow, unblocks on cancel, and HTML-escapes
-  error text.
+  authorization code, handles a denial from the consent screen, keeps waiting through
+  favicon probes, query-less stray requests and wrong-state requests (none of which
+  may consume the one-shot server), survives an idle connection that sends nothing,
+  unblocks on cancel, and HTML-escapes error text.
 - `IcsParserTest` covers TZID and UTC timestamps, all-day exclusive end dates, folded
   lines, escaped TEXT, `DURATION`, `VALARM` triggers, `RRULE`/`EXDATE`, modified
   occurrences, and a realistic Google Calendar export.
@@ -205,6 +215,11 @@ These are real gaps, not oversights waiting to be discovered:
   error rather than pretending to succeed.
 - **ICS import skips modified occurrences** of recurring series (`RECURRENCE-ID`), and
   says so in the import summary. Google's import endpoint has no way to attach them.
+- **VTIMEZONE definitions are ignored.** Windows/Outlook TZIDs are mapped by name to
+  IANA zones; an event with a truly custom TZID is skipped with a warning rather than
+  imported at the wrong wall-clock time. End-relative alarm triggers
+  (`TRIGGER;RELATED=END`) are skipped too — Google's reminder model cannot express
+  them.
 - **Guests are add-by-email only** — no contact picker, and no per-guest permissions.
 - **No attachments, no conference/Meet creation, no Google Tasks**, no calendar sharing
   or ACL management.

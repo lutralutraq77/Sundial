@@ -46,10 +46,13 @@ object AuthConfig {
     const val TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token"
     const val REVOKE_ENDPOINT = "https://oauth2.googleapis.com/revoke"
 
+    /** The one scope the app cannot function without; granted scopes are checked against it. */
+    const val CALENDAR_SCOPE = "https://www.googleapis.com/auth/calendar"
+
     val SCOPES = listOf(
         "openid",
         "email",
-        "https://www.googleapis.com/auth/calendar",
+        CALENDAR_SCOPE,
     )
 
     val SCOPE_PARAM: String get() = SCOPES.joinToString(" ")

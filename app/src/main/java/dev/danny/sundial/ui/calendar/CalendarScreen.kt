@@ -214,7 +214,7 @@ private fun CalendarDrawer(
             Column(modifier = Modifier.padding(start = 24.dp, top = 24.dp, bottom = 12.dp)) {
                 Text("Sundial", style = MaterialTheme.typography.titleLarge)
                 Text(
-                    text = state.accountEmail ?: "Not signed in",
+                    text = state.accountEmail ?: "Google account",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )

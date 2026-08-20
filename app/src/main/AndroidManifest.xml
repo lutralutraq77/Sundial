@@ -5,7 +5,14 @@
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <!-- API 33+: exact-alarm grant for calendar apps, given at install, not revocable. -->
     <uses-permission android:name="android.permission.USE_EXACT_ALARM" />
+    <!-- API 31/32: USE_EXACT_ALARM does not exist yet; SCHEDULE_EXACT_ALARM is
+         pre-granted at install there but user-revocable — revocation lands in the
+         inexact-alarm fallback in ReminderScheduler. -->
+    <uses-permission
+        android:name="android.permission.SCHEDULE_EXACT_ALARM"
+        android:maxSdkVersion="32" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
 
     <!-- Needed on API 30+ so we can resolve a browser for the OAuth Custom Tab. -->
@@ -20,9 +27,15 @@
         </intent>
     </queries>
 
+    <!-- allowBackup=false alone does NOT block device-to-device transfer on Android
+         12+; that needs dataExtractionRules. The secure prefs are ciphertext under a
+         Keystore key that can never leave this device — migrating them produces
+         values that fail to decrypt and would then be lazily deleted. -->
     <application
         android:name=".SundialApp"
         android:allowBackup="false"
+        android:dataExtractionRules="@xml/data_extraction_rules"
+        android:fullBackupContent="@xml/full_backup_content"
         android:enableOnBackInvokedCallback="true"
         android:icon="@mipmap/ic_launcher"
         android:label="@string/app_name"

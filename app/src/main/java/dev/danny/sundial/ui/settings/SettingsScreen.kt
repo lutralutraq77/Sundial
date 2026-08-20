@@ -263,7 +263,7 @@ fun SettingsScreen(
             HorizontalDivider()
             SettingsSection("About")
             SettingsInfo(
-                title = "Sundial 1.0",
+                title = "Sundial ${dev.danny.sundial.BuildConfig.VERSION_NAME}",
                 subtitle = "Talks to the Google Calendar REST API over HTTPS with an OAuth token. " +
                     "No Google Play Services, no Google libraries, no analytics.",
             )
@@ -284,12 +284,11 @@ fun SettingsScreen(
             confirmButton = {
                 TextButton(onClick = {
                     showSignOut = false
-                    scope.launch {
-                        container.auth.signOut()
-                        withContext(Dispatchers.IO) { container.clearLocalData() }
-                        SyncScheduler.cancelAll(context)
-                        onSignedOut()
-                    }
+                    // The whole sequence runs in the container's process-lifetime
+                    // scope: launching it here would let the recomposition that
+                    // removes this screen cancel the cleanup halfway through.
+                    container.signOut()
+                    onSignedOut()
                 }) { Text("Sign out") }
             },
             dismissButton = {

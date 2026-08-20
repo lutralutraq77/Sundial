@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The sundial_secure prefs hold AES-GCM ciphertext under an Android Keystore key,
+     and Keystore keys never transfer between devices. Migrated copies can never be
+     decrypted, so exclude them from cloud backup AND device-to-device transfer -->
+<data-extraction-rules>
+    <cloud-backup>
+        <exclude domain="sharedpref" path="sundial_secure.xml" />
+    </cloud-backup>
+    <device-transfer>
+        <exclude domain="sharedpref" path="sundial_secure.xml" />
+    </device-transfer>
+</data-extraction-rules>

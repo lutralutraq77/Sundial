@@ -80,13 +80,17 @@ fun ApiEvent.toEventItem(
         hangoutLink = hangoutLink,
         updatedMillis = TimeUtil.parseTimestampOrNull(updated) ?: 0L,
         colorHex = colorId?.let { eventColors[it] } ?: calendarColorHex,
+        busy = transparency != "transparent",
     )
 }
 
 private fun dev.danny.sundial.net.dto.ApiAttendee.toAttendee(): Attendee? {
-    val address = email ?: displayName ?: return null
+    // Keep email-less entries (rooms, contact-only guests) displayable by name, but
+    // never fabricate an address from the name — a write echoing it back as "email"
+    // fails the whole PATCH with "Invalid attendee email".
+    if (email == null && displayName == null) return null
     return Attendee(
-        email = address,
+        email = email,
         displayName = displayName,
         responseStatus = responseStatus,
         self = self,

@@ -4,8 +4,11 @@ import android.content.Context
 import android.net.Uri
 import android.util.Base64
 import dev.danny.sundial.net.Http
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -34,8 +37,29 @@ class AuthRepository(private val appContext: Context) {
     private val store = SecureStore(appContext)
     private val refreshMutex = Mutex()
 
+    /**
+     * Plain (non-secret) flags. A pending-sign-in marker lives here so that a process
+     * killed while the user was over in the browser can explain what happened instead
+     * of silently presenting an idle setup screen.
+     */
+    private val flags = appContext.getSharedPreferences("sundial_auth_flags", Context.MODE_PRIVATE)
+
     @Volatile
     private var pendingServer: LoopbackServer? = null
+
+    /**
+     * Bumped for every new or cancelled attempt. A finished coroutine only publishes
+     * its result while it is still the current attempt, so a cancelled sign-in cannot
+     * flash "Socket closed" and a stale attempt cannot clobber a live one's status.
+     * All bumps and status publications happen under [signInLock], which makes the
+     * check-then-publish atomic; the mid-flow read in [signIn] is a volatile read.
+     */
+    @Volatile
+    private var signInAttempt = 0
+
+    private val signInLock = Any()
+
+    private var signInJob: Job? = null
 
     private val _state = MutableStateFlow(readState())
     val state: StateFlow<AuthState> = _state.asStateFlow()
@@ -51,8 +75,24 @@ class AuthRepository(private val appContext: Context) {
      */
     private val signInScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 
-    private val _signIn = MutableStateFlow<SignInStatus>(SignInStatus.Idle)
+    private val _signIn = MutableStateFlow(initialSignInStatus())
     val signInStatus: StateFlow<SignInStatus> = _signIn.asStateFlow()
+
+    /**
+     * A pending-sign-in marker with no tokens means Android killed this process while
+     * the user was in the browser: the loopback server died with it, so Google's
+     * redirect hit a closed port. Nothing can be resumed — the verifier is gone — but
+     * the user deserves the explanation rather than a silently reset screen.
+     */
+    private fun initialSignInStatus(): SignInStatus {
+        if (!flags.getBoolean(KEY_SIGN_IN_PENDING, false)) return SignInStatus.Idle
+        flags.edit().putBoolean(KEY_SIGN_IN_PENDING, false).apply()
+        if (store.isStored(KEY_REFRESH_TOKEN)) return SignInStatus.Idle
+        return SignInStatus.Failed(
+            "Android closed Sundial while you were signing in, so the browser had nowhere " +
+                "to return to. Try again, and come back to the app soon after approving.",
+        )
+    }
 
     /**
      * Starts sign-in, or does nothing if one is already in flight.
@@ -63,14 +103,28 @@ class AuthRepository(private val appContext: Context) {
      * adds FLAG_ACTIVITY_NEW_TASK when handed a non-Activity context.
      */
     fun beginSignIn() {
-        if (_signIn.value == SignInStatus.Running) return
-        _signIn.value = SignInStatus.Running
-        signInScope.launch {
-            val result = signIn(appContext)
-            _signIn.value = result.fold(
-                onSuccess = { SignInStatus.Success(it) },
-                onFailure = { SignInStatus.Failed(it.message ?: "Sign-in failed.") },
-            )
+        synchronized(signInLock) {
+            if (_signIn.value == SignInStatus.Running) return
+            // The setup screen is only reachable with a broken session (no tokens, or
+            // credentials half-lost from the store). If a stale grant still lingers,
+            // drop it now — otherwise saving the credentials flips the root back to
+            // the calendar while this flow is still out in the browser, orphaning it.
+            if (_state.value.signedIn) forgetTokens()
+            val attempt = ++signInAttempt
+            _signIn.value = SignInStatus.Running
+            flags.edit().putBoolean(KEY_SIGN_IN_PENDING, true).apply()
+            signInJob = signInScope.launch {
+                val result = signIn(appContext, attempt)
+                synchronized(signInLock) {
+                    if (attempt == signInAttempt) {
+                        flags.edit().putBoolean(KEY_SIGN_IN_PENDING, false).apply()
+                        _signIn.value = result.fold(
+                            onSuccess = { SignInStatus.Success(it) },
+                            onFailure = { SignInStatus.Failed(it.message ?: "Sign-in failed.") },
+                        )
+                    }
+                }
+            }
         }
     }
 
@@ -80,38 +134,72 @@ class AuthRepository(private val appContext: Context) {
     }
 
     fun cancelSignInFlow() {
-        cancelSignIn()
-        _signIn.value = SignInStatus.Idle
+        synchronized(signInLock) {
+            signInAttempt++
+            // Actually cancel the coroutine: closing the server only unblocks the
+            // redirect wait, and an exchange already in flight would otherwise run
+            // to completion and sign the user in after they cancelled.
+            signInJob?.cancel()
+            signInJob = null
+            flags.edit().putBoolean(KEY_SIGN_IN_PENDING, false).apply()
+            cancelSignIn()
+            _signIn.value = SignInStatus.Idle
+        }
     }
 
     val clientId: String? get() = store.getString(KEY_CLIENT_ID)
     val clientSecret: String? get() = store.getString(KEY_CLIENT_SECRET)
 
-    fun saveClientCredentials(id: String, secret: String) {
+    /**
+     * Returns false when the keystore refused the write — the caller must not start
+     * a sign-in then, because the flow would run against the previous credentials.
+     */
+    fun saveClientCredentials(id: String, secret: String): Boolean = try {
         store.putString(KEY_CLIENT_ID, id.trim())
         store.putString(KEY_CLIENT_SECRET, secret.trim())
         _state.value = readState()
+        true
+    } catch (t: Exception) {
+        // Keystore writes can fail transiently; crashing the tap or silently keeping
+        // the old credentials would both mislead. Surface it where sign-in errors show.
+        _signIn.value = SignInStatus.Failed(
+            "Could not store the credentials securely (${t.message}). Try again in a moment.",
+        )
+        false
     }
 
     // ---- sign in -------------------------------------------------------
 
-    suspend fun signIn(context: Context): Result<String> {
+    private suspend fun signIn(context: Context, attempt: Int): Result<String> {
         val id = clientId
         val secret = clientSecret
         if (id.isNullOrBlank() || secret.isNullOrBlank()) {
             return Result.failure(AuthException("Add your Google OAuth client ID and secret first."))
         }
 
+        val verifier = Pkce.createVerifier()
+        val stateParam = Pkce.randomState()
+
         val server = try {
-            LoopbackServer()
+            // The server filters on the state value, so a request from a process that
+            // does not know it can never consume the one-shot redirect wait.
+            LoopbackServer(expectedState = stateParam)
         } catch (t: Throwable) {
-            return Result.failure(AuthException("Could not open a local port for the sign-in redirect: ${t.message}"))
+            // On GrapheneOS with the Network toggle off, even the loopback *bind* fails
+            // with EACCES — this is the first thing sign-in does, so the friendly DNS
+            // message further down is unreachable. Point at the permission here.
+            return Result.failure(
+                AuthException(
+                    "Could not open a local port for the sign-in redirect: ${t.message}. " +
+                        "On GrapheneOS this usually means Sundial's Network permission is " +
+                        "off — check Settings → Apps → Sundial → Permissions → Network, " +
+                        "then try again.",
+                ),
+            )
         }
         pendingServer = server
 
         return try {
-            val verifier = Pkce.createVerifier()
-            val stateParam = Pkce.randomState()
             // Explicitly on the main thread: sign-in now runs in an application
             // scope on Dispatchers.Default, and starting an Activity (Custom Tab)
             // from a background thread is not something to rely on.
@@ -130,6 +218,8 @@ class AuthRepository(private val appContext: Context) {
             val params = withTimeoutOrNull(SIGN_IN_TIMEOUT_MS) { awaitRedirect(server) }
                 ?: throw AuthException("Sign-in timed out.")
 
+            // The server already enforces the state match (it 404s everything else),
+            // so this is an invariant assertion rather than the validation itself.
             if (params["state"] != stateParam) {
                 throw AuthException("The sign-in response did not match this request.")
             }
@@ -154,19 +244,57 @@ class AuthRepository(private val appContext: Context) {
                         "myaccount.google.com/permissions and sign in again.",
                 )
 
+            // Google's granular-consent screen lets the account be approved with the
+            // calendar checkbox unticked; the exchange still succeeds. Storing that
+            // grant would show a signed-in app where every calendar call 403s forever.
+            val granted = token.scope?.split(' ')?.filter { it.isNotBlank() }
+            if (granted != null && AuthConfig.CALENDAR_SCOPE !in granted) {
+                revokeToken(refreshToken)
+                throw AuthException(
+                    "Google approved the account but not calendar access. Sign in again " +
+                        "and tick the checkbox that mentions your calendars on the " +
+                        "consent screen.",
+                )
+            }
+
             val email = emailFromIdToken(token.idToken)
-            store.putString(KEY_REFRESH_TOKEN, refreshToken)
-            store.putString(KEY_ACCESS_TOKEN, token.accessToken)
-            store.putLong(KEY_ACCESS_EXPIRY, System.currentTimeMillis() + token.expiresIn * 1000L)
-            store.putString(KEY_EMAIL, email)
-            _state.value = readState()
+
+            // A cancelled attempt must not complete the login behind the user's back.
+            // Job cancellation stops the exchange at every suspension point; this
+            // closes the last window, where the exchange finished first. The commit is
+            // straight-line keystore writes that cancel() cannot interrupt, so the
+            // re-check and the writes sit under the same lock cancelSignInFlow's bump
+            // takes — a Cancel either lands before this block (nothing is stored) or
+            // after it (the sign-in had already completed).
+            val committed = synchronized(signInLock) {
+                if (attempt == signInAttempt) {
+                    store.putString(KEY_REFRESH_TOKEN, refreshToken)
+                    store.putString(KEY_ACCESS_TOKEN, token.accessToken)
+                    store.putLong(KEY_ACCESS_EXPIRY, System.currentTimeMillis() + token.expiresIn * 1000L)
+                    store.putString(KEY_EMAIL, email)
+                    _state.value = readState()
+                    true
+                } else {
+                    false
+                }
+            }
+            if (!committed) {
+                // The unwanted grant is revoked (off the lock — it's a network call).
+                revokeToken(refreshToken)
+                throw AuthException("Sign-in was cancelled.")
+            }
 
             Result.success(email ?: "your Google account")
         } catch (t: Throwable) {
+            // Cancellation is not a failure to report — and swallowing it would let a
+            // cancelled coroutine keep running to the publish step.
+            if (t is CancellationException) throw t
             Result.failure(if (t is AuthException) t else AuthException(describeSignInError(t)))
         } finally {
             server.close()
-            pendingServer = null
+            // A stale attempt unwinding late must not clobber the reference to a
+            // newer attempt's live server — that would disarm its Cancel button.
+            if (pendingServer === server) pendingServer = null
         }
     }
 
@@ -238,10 +366,15 @@ class AuthRepository(private val appContext: Context) {
             return@withLock cached
         }
 
+        // A null read means one of two very different things, and only one of them may
+        // destroy state: genuinely absent (reset auth so the setup screen returns) vs
+        // stored-but-keystore-busy (fail soft and retry later — deleting here would
+        // turn a transient keymaster hiccup after boot/OTA into a permanent sign-out).
         val refreshToken = store.getString(KEY_REFRESH_TOKEN)
-            ?: throw AuthException("Not signed in.", requiresReauth = true)
-        val id = clientId ?: throw AuthException("Missing client ID.", requiresReauth = true)
-        val secret = clientSecret ?: throw AuthException("Missing client secret.", requiresReauth = true)
+            ?: throw absentOrUnavailable(KEY_REFRESH_TOKEN, "Not signed in.")
+        val id = clientId ?: throw absentOrUnavailable(KEY_CLIENT_ID, "Missing client ID.")
+        val secret = clientSecret
+            ?: throw absentOrUnavailable(KEY_CLIENT_SECRET, "Missing client secret.")
 
         val token = try {
             postForm(
@@ -274,24 +407,57 @@ class AuthRepository(private val appContext: Context) {
 
     suspend fun signOut(revoke: Boolean = true) {
         val refreshToken = store.getString(KEY_REFRESH_TOKEN)
-        if (revoke && refreshToken != null) {
-            withContext(Dispatchers.IO) {
-                runCatching {
-                    val request = Request.Builder()
-                        .url(AuthConfig.REVOKE_ENDPOINT)
-                        .post(FormBody.Builder().add("token", refreshToken).build())
-                        .build()
-                    Http.client.newCall(request).execute().close()
-                }
+        // Local flip first: the UI must not sit on a signed-in-looking calendar while
+        // the network revocation waits out its timeouts on a bad connection.
+        forgetTokens()
+        if (revoke && refreshToken != null) revokeToken(refreshToken)
+    }
+
+    /**
+     * Called when Google definitively rejects the session at the API layer (a 401
+     * that survives a forced refresh). Without this the app stays "signed in" with
+     * every sync failing and no path back to the setup screen.
+     */
+    fun sessionRejected() {
+        forgetTokens()
+    }
+
+    /** Best-effort revocation at Google's end; failure changes nothing locally. */
+    private suspend fun revokeToken(token: String) {
+        // NonCancellable: this mostly runs as cleanup on an already-cancelled attempt,
+        // where a cancellable withContext would throw before doing anything.
+        withContext(NonCancellable + Dispatchers.IO) {
+            runCatching {
+                val request = Request.Builder()
+                    .url(AuthConfig.REVOKE_ENDPOINT)
+                    .post(FormBody.Builder().add("token", token).build())
+                    .build()
+                Http.client.newCall(request).execute().close()
             }
         }
-        forgetTokens()
     }
 
     private fun forgetTokens() {
         store.clear(KEY_REFRESH_TOKEN, KEY_ACCESS_TOKEN, KEY_ACCESS_EXPIRY, KEY_EMAIL)
         _state.value = readState()
     }
+
+    /** The stored grant is unusable; drop the remnants so the UI returns to setup. */
+    private fun missingAuth(message: String): AuthException {
+        forgetTokens()
+        return AuthException(message, requiresReauth = true)
+    }
+
+    /**
+     * "Absent" resets auth state; "stored but unreadable right now" must not — the
+     * ciphertext is intact and the keystore will answer again shortly.
+     */
+    private fun absentOrUnavailable(key: String, missingMessage: String): AuthException =
+        if (store.isStored(key)) {
+            AuthException("Secure storage is temporarily unavailable — try again in a moment.")
+        } else {
+            missingAuth(missingMessage)
+        }
 
     // ---- helpers -------------------------------------------------------
 
@@ -304,19 +470,31 @@ class AuthRepository(private val appContext: Context) {
 
             Http.client.newCall(request).execute().use { response ->
                 val text = response.body?.string().orEmpty()
-                val parsed = runCatching { Http.json.decodeFromString<TokenResponse>(text) }.getOrNull()
-                if (!response.isSuccessful || parsed?.accessToken == null) {
-                    val reason = parsed?.errorDescription
-                        ?: parsed?.error
-                        ?: "HTTP ${response.code}"
+                val parsed = runCatching { Http.json.decodeFromString<TokenResponse>(text) }
+                val body = parsed.getOrNull()
+                if (!response.isSuccessful || body?.accessToken == null) {
+                    // A 2xx whose body will not parse is not "HTTP 200" — say what
+                    // actually went wrong, or diagnosing it is guesswork.
+                    val reason = body?.errorDescription
+                        ?: body?.error
+                        ?: if (response.isSuccessful) {
+                            "Unexpected reply from Google — the token response could not " +
+                                "be read" +
+                                (parsed.exceptionOrNull()?.message?.let { " ($it)" } ?: ".")
+                        } else {
+                            "HTTP ${response.code}"
+                        }
+                    // Only a parsed OAuth error may condemn the stored grant. This
+                    // endpoint is HTTPS against Google's own certificate, so any
+                    // response that reaches here is genuinely Google's — but a bare
+                    // status code says nothing about whether the grant is dead.
                     throw AuthException(
                         reason,
-                        requiresReauth = parsed?.error == "invalid_grant" ||
-                            parsed?.error == "invalid_client" ||
-                            response.code == 400 || response.code == 401,
+                        requiresReauth = body?.error == "invalid_grant" ||
+                            body?.error == "invalid_client",
                     )
                 }
-                parsed
+                body
             }
         }
 
@@ -332,9 +510,12 @@ class AuthRepository(private val appContext: Context) {
     }
 
     private fun readState() = AuthState(
-        hasCredentials = !store.getString(KEY_CLIENT_ID).isNullOrBlank() &&
-            !store.getString(KEY_CLIENT_SECRET).isNullOrBlank(),
-        signedIn = !store.getString(KEY_REFRESH_TOKEN).isNullOrBlank(),
+        // isStored, not getString: a keystore that is busy right after boot or an OTA
+        // must not present a signed-in user with an empty setup screen. A value that
+        // turns out permanently unreadable is deleted on its first real use, so this
+        // resolves itself for genuinely dead ciphertext.
+        hasCredentials = store.isStored(KEY_CLIENT_ID) && store.isStored(KEY_CLIENT_SECRET),
+        signedIn = store.isStored(KEY_REFRESH_TOKEN),
         email = store.getString(KEY_EMAIL),
     )
 
@@ -345,6 +526,8 @@ class AuthRepository(private val appContext: Context) {
         const val KEY_ACCESS_TOKEN = "access_token"
         const val KEY_ACCESS_EXPIRY = "access_expiry"
         const val KEY_EMAIL = "account_email"
+
+        const val KEY_SIGN_IN_PENDING = "sign_in_pending"
 
         const val TOKEN_SKEW_MS = 60_000L
         const val SIGN_IN_TIMEOUT_MS = 10 * 60 * 1000L

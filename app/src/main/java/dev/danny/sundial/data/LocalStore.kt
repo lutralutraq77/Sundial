@@ -61,6 +61,7 @@ class LocalStore(context: Context) : SQLiteOpenHelper(context.applicationContext
                 remindersOverrides TEXT,
                 hangoutLink TEXT,
                 updatedMillis INTEGER NOT NULL DEFAULT 0,
+                busy INTEGER NOT NULL DEFAULT 1,
                 syncMark INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (calendarId, id)
             )
@@ -72,6 +73,12 @@ class LocalStore(context: Context) : SQLiteOpenHelper(context.applicationContext
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
+        if (oldVersion == 1 && newVersion == 2) {
+            // Events are disposable, but calendars.visible is a local preference a
+            // drop-and-recreate would silently reset — alter in place instead.
+            db.execSQL("ALTER TABLE events ADD COLUMN busy INTEGER NOT NULL DEFAULT 1")
+            return
+        }
         db.execSQL("DROP TABLE IF EXISTS events")
         db.execSQL("DROP TABLE IF EXISTS calendars")
         db.execSQL("DROP TABLE IF EXISTS meta")
@@ -170,7 +177,10 @@ class LocalStore(context: Context) : SQLiteOpenHelper(context.applicationContext
     fun deleteUnmarked(calendarId: String, windowStart: Long, windowEnd: Long, syncMark: Long): Int =
         writableDatabase.delete(
             "events",
-            "calendarId = ? AND syncMark != ? AND endMillis > ? AND startMillis < ?",
+            // Strictly older marks only: rows stamped at or after the run began are
+            // local writes made mid-sync, and sweeping those deletes an event the
+            // user just saved. A later sync re-confirms or sweeps them properly.
+            "calendarId = ? AND syncMark < ? AND endMillis > ? AND startMillis < ?",
             arrayOf(calendarId, syncMark.toString(), windowStart.toString(), windowEnd.toString()),
         )
 
@@ -215,10 +225,15 @@ class LocalStore(context: Context) : SQLiteOpenHelper(context.applicationContext
             .use { cursor -> if (cursor.moveToFirst()) readEvent(cursor) else null }
 
     fun search(query: String, limit: Int = 200): List<EventItem> {
-        val needle = "%${query.trim()}%"
+        // % and _ in the user's text are literals, not LIKE wildcards.
+        val escaped = query.trim()
+            .replace("\\", "\\\\")
+            .replace("%", "\\%")
+            .replace("_", "\\_")
+        val needle = "%$escaped%"
         val sql = """
             SELECT * FROM events
-            WHERE (summary LIKE ? OR description LIKE ? OR location LIKE ?)
+            WHERE (summary LIKE ? ESCAPE '\' OR description LIKE ? ESCAPE '\' OR location LIKE ? ESCAPE '\')
               AND calendarId IN (SELECT id FROM calendars WHERE visible = 1)
             ORDER BY startMillis DESC
             LIMIT ?
@@ -311,6 +326,7 @@ class LocalStore(context: Context) : SQLiteOpenHelper(context.applicationContext
         put("remindersOverrides", encodeReminders(event.reminders.overrides))
         put("hangoutLink", event.hangoutLink)
         put("updatedMillis", event.updatedMillis)
+        put("busy", if (event.busy) 1 else 0)
         put("syncMark", syncMark)
     }
 
@@ -352,6 +368,7 @@ class LocalStore(context: Context) : SQLiteOpenHelper(context.applicationContext
         hangoutLink = cursor.string("hangoutLink"),
         updatedMillis = cursor.long("updatedMillis"),
         colorHex = cursor.string("colorHex") ?: "#4285F4",
+        busy = cursor.int("busy") == 1,
     )
 
     private fun Cursor.string(name: String): String? {
@@ -388,7 +405,7 @@ class LocalStore(context: Context) : SQLiteOpenHelper(context.applicationContext
     private fun encodeAttendees(attendees: List<Attendee>): String =
         attendees.joinToString("\n") { attendee ->
             listOf(
-                attendee.email,
+                attendee.email.orEmpty(),
                 attendee.displayName.orEmpty(),
                 attendee.responseStatus.orEmpty(),
                 if (attendee.self) "1" else "0",
@@ -403,7 +420,7 @@ class LocalStore(context: Context) : SQLiteOpenHelper(context.applicationContext
                 if (line.isBlank()) return@mapNotNull null
                 val parts = line.split('\t')
                 Attendee(
-                    email = parts.getOrNull(0).orEmpty(),
+                    email = parts.getOrNull(0)?.takeIf { it.isNotBlank() },
                     displayName = parts.getOrNull(1)?.takeIf { it.isNotBlank() },
                     responseStatus = parts.getOrNull(2)?.takeIf { it.isNotBlank() },
                     self = parts.getOrNull(3) == "1",
@@ -415,6 +432,6 @@ class LocalStore(context: Context) : SQLiteOpenHelper(context.applicationContext
 
     private companion object {
         const val NAME = "sundial.db"
-        const val VERSION = 1
+        const val VERSION = 2
     }
 }

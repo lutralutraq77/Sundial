@@ -11,6 +11,8 @@ import dev.danny.sundial.core.TimeUtil
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import java.time.DayOfWeek
@@ -59,7 +61,17 @@ class CalendarViewModel(private val container: AppContainer) : ViewModel() {
         viewModelScope.launch {
             container.repository.changes.collect { reload() }
         }
-        sync()
+        // Sync on every signed-in transition, not once in init: this ViewModel is
+        // Activity-scoped and survives a sign-out, so after a re-login init has long
+        // since run and the freshly-wiped cache would otherwise stay empty forever.
+        // The initial emission covers the first launch (signedIn is already true when
+        // this ViewModel is created); the sign-out emission drops the old account's
+        // events from the UI.
+        viewModelScope.launch {
+            container.auth.state.map { it.signedIn }.distinctUntilChanged().collect { signedIn ->
+                if (signedIn) sync() else reload()
+            }
+        }
     }
 
     // ---- navigation ----------------------------------------------------
@@ -89,12 +101,19 @@ class CalendarViewModel(private val container: AppContainer) : ViewModel() {
 
     // ---- data ----------------------------------------------------------
 
+    /** Bumped per reload; a completed query publishes only if no newer reload started. Main-thread only. */
+    private var reloadGeneration = 0L
+
     private fun reload() {
+        val generation = ++reloadGeneration
         viewModelScope.launch {
             val current = _state.value
             val (from, to) = rangeFor(current.view, current.anchor, current.firstDayOfWeek)
             val events = container.repository.eventsBetween(from, to)
             val calendars = container.repository.calendars()
+            // Queries run on IO and resume in completion order — a slow query for an
+            // old range must not overwrite a newer range's published results.
+            if (generation != reloadGeneration) return@launch
             _state.update {
                 it.copy(
                     events = events,
@@ -114,13 +133,20 @@ class CalendarViewModel(private val container: AppContainer) : ViewModel() {
         _state.update { it.copy(syncing = true) }
         viewModelScope.launch {
             val outcome = container.syncEngine.sync()
-            container.reminderScheduler.rescheduleAll()
+            // A sign-out can land while the sync was in flight; re-arming alarms from
+            // rows the cleanup is deleting would resurrect the old account's reminders.
+            if (container.auth.state.value.signedIn) {
+                container.reminderScheduler.rescheduleAll()
+            }
             _state.update {
                 it.copy(
                     syncing = false,
                     lastSyncMillis = container.prefs.lastSyncMillis,
                     lastSyncError = outcome.error,
-                    message = outcome.error,
+                    // A successful sync must not null a queued confirmation ("Event
+                    // saved"/"Event deleted") — that restarts the snackbar effect
+                    // and cancels it mid-display.
+                    message = outcome.error ?: it.message,
                 )
             }
             reload()
